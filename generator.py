@@ -2,6 +2,7 @@ from typing import List, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from torch.distributions import Categorical
 from envs import AlphaGenerationEnv
 
@@ -77,11 +78,11 @@ class ValueNetwork(nn.Module):
         self, x: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Args:
+        参数:
             x: 输入 token 序列，形状为 (batch_size, seq_len)。
             hidden: LSTM 隐藏状态。
 
-        Returns:
+        返回值:
             value: 每个序列的状态价值，形状为 (batch_size,)。
             hidden: 更新后的隐藏状态。
         """
@@ -105,12 +106,12 @@ class ValueNetwork(nn.Module):
 
 class RLAlphaGenerator:
     """
-    使用 PPO 在 AlphaGenerationEnv 上训练生成 alpha 表达式的策略。
+    使用 PPO 在 `AlphaGenerationEnv` 中训练策略网络，自动生成高 IC 的 Alpha 表达式。
     """
 
     def __init__(self, env: AlphaGenerationEnv, config: Dict[str, Any]) -> None:
         """
-        Args:
+        参数:
             env: 强化学习环境，需支持 reset(), step(action), valid_actions() 接口。
             config: 包含网络和 PPO 超参数的配置字典。
         """
@@ -138,15 +139,70 @@ class RLAlphaGenerator:
         self.update_epochs = config.get("update_epochs", 4)
         self.batch_size = config.get("batch_size", 64)
         self.max_seq_len = config.get("max_seq_len", 20)
-
+    
     def train(self, num_iterations: int) -> None:
         """
-        运行 PPO 训练循环，更新策略和值函数。
-
-        Args:
-            num_iterations: 训练轮数，每轮会进行一次 trajectory 收集与 PPO 更新。
+        用 PPO 训练策略 & 价值网络。
+        每轮：
+          ① 与环境交互，采样 batch_size 步（或更多）完整 episode
+          ② 计算优势 (A = R - V) 并标准化
+          ③ 对策略 / 价值网络做多次 epoch 更新
         """
-        ...
+        for it in range(1, num_iterations + 1):
+            # ------ 采样轨迹 -------------------------------------------------
+            states, actions, old_logps, returns, advantages = self._collect_trajectories()
+
+            # Advantage 标准化以稳定训练
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            # 打包成 DataLoader，方便多轮 epoch shuffle
+            ds = TensorDataset(states, actions, old_logps, returns, advantages)
+            loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
+
+            for _ in range(self.update_epochs):
+                for s, a, logp_old, ret, adv in loader:
+                    s = s.to(self.device)
+                    a = a.to(self.device)
+                    logp_old = logp_old.to(self.device).detach()
+                    ret = ret.to(self.device)
+                    adv = adv.to(self.device)
+
+                    # ----- 1. 重新计算策略 & log π(a|s) ---------------------
+                    h0_p = self.policy_net.init_hidden(s.size(0), self.device)
+                    logits, _ = self.policy_net(s, h0_p)
+                    dist = Categorical(logits=logits)
+                    logp = dist.log_prob(a)
+                    entropy = dist.entropy().mean()
+
+                    # ----- 2. 计算 PPO clip 损失 ---------------------------
+                    ratio = (logp - logp_old).exp()
+                    pg_loss = -torch.min(
+                        ratio * adv,
+                        torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv,
+                    ).mean()
+
+                    # ----- 3. 计算价值函数损失 -----------------------------
+                    h0_v = self.value_net.init_hidden(s.size(0), self.device)
+                    value_pred, _ = self.value_net(s, h0_v)
+                    value_loss = F.mse_loss(value_pred.squeeze(-1), ret)
+
+                    # ----- 4. 总损失 & 反向传播 ----------------------------
+                    loss = pg_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                    self.policy_optimizer.zero_grad()
+                    self.value_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+                    self.policy_optimizer.step()
+                    self.value_optimizer.step()
+
+            # ------ 打印监控信息 --------------------------------------------
+            if it % 10 == 0:
+                with torch.no_grad():
+                    avg_ret = returns.mean().item()
+                    combo_ic = self.env.combo_model.score()
+                print(f"[Iter {it:04d}]  AvgReturn={avg_ret:+.4f}   ComboIC={combo_ic:+.4f}")
 
     def _collect_trajectories(
         self,
@@ -154,14 +210,20 @@ class RLAlphaGenerator:
         List[torch.Tensor], List[int], List[torch.Tensor], List[float], List[float]
     ]:
         """
-        从环境中采样若干条完整轨迹，用于 PPO 更新。
+        从环境中采样一批完整轨迹，并计算回报与优势值（GAE λ=1）。
 
-        Returns:
-            states: token 序列 (List[Tensor])。
-            actions: 选择的动作 token_id (List[int])。
-            logps: 对应动作的 log 概率 (List[Tensor])。
-            returns: 每个步骤对应的回报值 (List[float])。
-            advantages: 每个步骤的 advantage（此处为简化直接用 return）。
+        返回
+        ----------
+        states : torch.Tensor
+            形状 ``(T, seq_len)`` 的 token 序列张量。
+        actions : torch.Tensor
+            长度 ``T`` 的动作 ID。
+        logps : torch.Tensor
+            对应动作的对数概率。
+        returns : torch.Tensor
+            折现回报。
+        advantages : torch.Tensor
+            Advantage 值（此处为 `return - value`）。
         """
         states, actions, logps, rewards, dones, values = [], [], [], [], [], []
 
@@ -172,14 +234,16 @@ class RLAlphaGenerator:
             logits, h_p = self.policy_net(obs, h_p)
 
             # -------- Invalid-action-mask --------
-            mask = torch.tensor([self.env.action_mask()], device=self.device)
-            logits[mask == 0] = -1e9
+            valid = self.env.valid_actions()
+            mask = torch.full((self.vocab_size,), float('-inf'), device=self.device)
+            mask[valid] = 0.0                                # 合法动作设置成 0，其它仍为 −inf
+            logits = logits + mask                          # 非法动作 logits 变为 −inf
             dist = Categorical(logits=logits)
             
             action = dist.sample()
             logp = dist.log_prob(action)
 
-            value, h_v = self.value_net(action)
+            value, h_v = self.value_net(obs, h_v)
 
             next_obs, reward, done, _ = self.env.step(action.item())
             states.append(obs.squeeze(0))

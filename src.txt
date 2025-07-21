@@ -1,103 +1,5 @@
 ================================================================================
-File: ./envs.py
---------------------------------------------------------------------------------
-# env.py
-from combination import AlphaCombinationModel
-from typing import List
-
-class AlphaGenerationEnv:
-    """
-    自定义强化学习环境，无需依赖 OpenAI Gym。
-    State: token ID 序列
-    Action: 下一个 token ID
-    Reward: 表达式结束时组合模型返回的 IC
-    """
-    def __init__(self, combo_model, tokenizer, max_len=20):
-        self.combo_model = combo_model
-        self.tokenizer = tokenizer
-        self.max_len = max_len
-        self.reset()
-
-    def reset(self):
-        self.sequence = [self.tokenizer.bos_token_id]
-        self.done = False
-        return self._get_obs()
-
-    def step(self, action: int):
-        self.sequence.append(action)
-        token = self.tokenizer.decode([action])
-        reward = 0.0
-        if token == self.tokenizer.sep_token or len(self.sequence) >= self.max_len:
-            expr = self.tokenizer.decode(self.sequence[1:-1])
-            reward = self.combo_model.evaluate_alpha(expr)
-            self.done = True
-        obs = self._get_obs()
-        return obs, reward, self.done, {}
-
-    def _get_obs(self):
-        # 返回 list[int]；PPO 里再转 tensor
-        return self.sequence
-    
-    def valid_actions(self) -> List[int]:
-        """
-        返回当前状态下合法 token_id 的列表，用于 Invalid-Action-Mask。
-        简化实现：只防止过长 & 必须以 sep 终止；更细规则见 Appendix C。
-        """
-        if self.done:
-            return []                      # episode 已结束
-        if len(self.sequence) >= self.max_len - 1:
-            return [self.tokenizer.sep_token_id]  # 只能收尾
-        # 否则全部 token 都可选
-        return list(range(self.tokenizer.vocab_size))
-    
-
-
-
-================================================================================
-File: ./utility.py
---------------------------------------------------------------------------------
-# utility.py
-
-import numpy as np
-import pandas as pd
-
-def zscore_normalize(series: pd.Series) -> pd.Series:
-    """
-    Z-score 标准化处理：消除因子的尺度影响
-    """
-    mean = series.mean()
-    std = series.std()
-    if std == 0 or np.isnan(std):
-        return pd.Series(np.zeros_like(series), index=series.index)
-    return (series - mean) / std
-
-def winsorize(series: pd.Series, lower_quantile: float = 0.01, upper_quantile: float = 0.99) -> pd.Series:
-    """
-    异常值截断处理：防止 outlier 扰动因子稳定性
-    """
-    lower = series.quantile(lower_quantile)
-    upper = series.quantile(upper_quantile)
-    return series.clip(lower=lower, upper=upper)
-
-def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
-    """
-    信息系数（IC）：衡量因子预测未来收益的能力，Pearson 相关系数
-    """
-    if len(factor) != len(target):
-        raise ValueError("Factor and target length mismatch")
-    if np.std(factor) == 0 or np.std(target) == 0:
-        return 0.0
-    
-    ic = np.corrcoef(factor, target)[0, 1]
-    return float(np.nan_to_num(ic))
-
-================================================================================
-File: ./__init__.py
---------------------------------------------------------------------------------
-
-
-================================================================================
-File: ./combination.py
+File: .\combination.py
 --------------------------------------------------------------------------------
 # combination.py
 import numpy as np
@@ -342,131 +244,218 @@ def _is_float(str) -> bool:
         return False
 
 ================================================================================
-File: ./tokenizer.py
+File: .\data.py
 --------------------------------------------------------------------------------
-# tokenizer.py
-import re
-import inspect
-import operators
-from typing import List, Dict
+# data.py 
 
-class AlphaTokenizer:
+import pandas as pd
+
+
+def load_market_data(path: str = "data/rb_20250606_primary.csv", n: int = 5):
     """
-    将 RPN 表达式（如 'close 5 ts_mean'）转化为 token ID 序列。
+    读取并预处理原始 A 股行情数据。
+
+    参数
+    ----------
+    path : str, 可选
+        CSV 文件的本地路径，默认为 ``"data/rb_20250606_primary.csv"``。
+    n: int 可选
+        预测 n 秒之后的收益率
+
+    返回
+    ----------
+    pandas.DataFrame
+        处理后的行情特征表，包含基础字段以及 ``target``（20 日远期收益）列。
     """
-    def __init__(self, base_fields: List[str] = None, const_buckets: List[float] = None):
-        """
-        Args:
-            base_fields: 基础行情字段列表，例如 ['open', 'high', 'low', 'close', 'volume']
-            const_buckets: 预定义常量列表，例如 [1, 3, 5, 10, 20]
-        """
-        if base_fields is None:
-            base_fields = ['open', 'high', 'low', 'close', 'volume']
-        if const_buckets is None:
-            const_buckets = [1, 3, 5, 10, 20, 0.1, 0.5]
+    # TODO: 这里暂时读取本地文件
 
-        self.base_fields = base_fields
-        self.const_buckets = const_buckets
-
-        # 特殊 token
-        self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
-
-        # 基础字段 token
-        field_tokens = base_fields
-
-        # 常量 token
-        const_tokens = [f'CONST_{c}' for c in const_buckets]
-
-        # 算子 token：自动扫描 operators.py
-        op_tokens = []
-        for name, fn in inspect.getmembers(operators, inspect.isfunction):
-            if not name.startswith("_"):
-                op_tokens.append(name)
-
-        # 词表
-        arith = ['+', '-', '*', '/']
-        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens + arith
-
-        # ID ↔ Token 映射
-        self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
-        self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
-
-        # 便捷属性
-        self.pad_token_id = self.token_to_id['[PAD]']
-        self.bos_token_id = self.token_to_id['[BOS]']
-        self.sep_token_id = self.token_to_id['[SEP]']
-
-    @property
-    def vocab_size(self) -> int:
-        return len(self.vocab)
-
-    def encode(self, expr: str, add_special_tokens: bool = True) -> List[int]:
-        """
-        将 RPN 表达式编码为 token ID 序列。
-        """
-        tokens = expr.strip().split()
-        ids = []
-        for tk in tokens:
-            # 基础字段
-            if tk in self.token_to_id:
-                ids.append(self.token_to_id[tk])
-            # 常量：动态加入最近的 bucket
-            elif self._is_float(tk):
-                val = float(tk)
-                const_tok = self._map_to_const(val)
-                ids.append(self.token_to_id[const_tok])
-            else:
-                raise ValueError(f"未知 token：{tk}")
-
-        if add_special_tokens:
-            ids = [self.bos_token_id] + ids + [self.sep_token_id]
-        return ids
-
-    def decode(self, ids: List[int], remove_special_tokens: bool = True) -> str:
-        """
-        将 token ID 序列解码为 RPN 表达式。
-        """
-        toks = []
-        for idx in ids:
-            if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
-                continue
-            toks.append(self.id_to_token.get(idx, 'UNK'))
-        # 常量还原
-        toks = [self._const_to_str(tk) for tk in toks]
-        return " ".join(toks)
-
-    def _map_to_const(self, val: float) -> str:
-        """
-        将任意浮点数映射到最近的常量 bucket。
-        """
-        closest = min(self.const_buckets, key=lambda x: abs(x - val))
-        return f'CONST_{closest}'
-
-    def _const_to_str(self, token: str) -> str:
-        """
-        将 CONST_x 还原为 x 的字符串。
-        """
-        if token.startswith('CONST_'):
-            return token.split('_', 1)[1]
-        return token
-
-    @staticmethod
-    def _is_float(s: str) -> bool:
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-
+    df = pd.read_csv(path, parse_dates=["timestamp"], index_col="timestamp")
+    df = df["close"].resample("1s").ohlc()
+    df["target"] = df["close"].pct_change(periods=-n)
+    return df
 
 
 ================================================================================
-File: ./generator.py
+File: .\envs.py
+--------------------------------------------------------------------------------
+# env.py
+from combination import AlphaCombinationModel
+from tokenizer import AlphaTokenizer
+from typing import List
+
+
+class AlphaGenerationEnv:
+    """
+    自定义强化学习环境：生成逆波兰表达式（RPN）的序列决策过程。
+
+    - **状态**：当前已生成的 token ID 列表
+    - **动作**：下一个 token 的 ID
+    - **奖励**：组合模型评估的单因子 IC
+    - **终止条件**：生成 `[SEP]` 或达到 `max_len`
+    """
+
+    def __init__(
+        self, combo_model: AlphaCombinationModel, tokenizer: AlphaTokenizer, max_len=20
+    ):
+        """
+        初始化环境。
+
+        参数
+        ----------
+        combo_model : AlphaCombinationModel
+            负责因子池管理与 IC 计算的组合模型。
+        tokenizer : AlphaTokenizer
+            RPN ↔ token 序列转换器。
+        max_len : int, 可选
+            生成序列的最⼤长度（含 `[BOS]` 与 `[SEP]`），默认 20。
+        """
+        self.combo_model = combo_model
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.reset()
+
+    def reset(self):
+        """
+        重新开始一条新序列。
+
+        返回
+        ----------
+        List[int]
+            仅包含 `[BOS]` 的初始序列。
+        """
+        self.sequence = [self.tokenizer.bos_token_id]
+        self.done = False
+        return self._get_obs()
+
+    def step(self, action: int):
+        """
+        执行一步生成并返回环境转移结果。
+
+        参数
+        ----------
+        action : int
+            选定的 token ID。
+
+        返回
+        ----------
+        obs : List[int]
+            新的 token 序列。
+        reward : float
+            若已结束则为该表达式的单因子 IC，否则为 0。
+        done : bool
+            是否到达终止状态。
+        info : dict
+            预留调试信息，当前为空字典。
+        """
+        self.sequence.append(action)
+        token = self.tokenizer.decode([action])
+        reward = 0.0
+        if token == self.tokenizer.sep_token or len(self.sequence) >= self.max_len:
+            expr = self.tokenizer.decode(self.sequence[1:-1])
+            reward = self.combo_model.evaluate_alpha(expr)
+            self.done = True
+        obs = self._get_obs()
+        return obs, reward, self.done, {}
+
+    def _get_obs(self):
+        """
+        获取当前观测值（token 序列）。
+
+        返回
+        ----------
+        List[int]
+            当前生成序列（含 `[BOS]`，可能含 `[SEP]`）。
+        """
+        return self.sequence
+
+    def valid_actions(self) -> List[int]:
+        """
+        计算当前状态下的合法动作集合，用于 Invalid-Action-Mask。
+
+        规则（基于逆波兰表达式 RPN）
+        ------------------------------------------------------------
+        1. 维护一个“栈深”计数：
+           • 操作数（基础字段或常量）   → 栈深 +1
+           • 算子（arity = n）         → 栈深 −(n-1)
+        2. 任何前缀片段都必须满足栈深 ≥ 0（否则语法非法）。
+        3. 仅当栈深 == 1 时才允许收尾 `[SEP]`。
+        4. 生成过程中禁止再次选择 `[BOS]`、`[PAD]`。
+        5. 若已接近最大长度，只允许 `[SEP]`。
+        """
+        # ---------------- 终止态快速返回 ----------------
+        if self.done:
+            return []  # Episode 已结束
+
+        # ---------- 1. 当前栈深 -------------------------------------------------
+        #    跳过首个 [BOS]；若最后已是 [SEP]，说明逻辑上应已 done，但稳妥起见再校验
+        sep_str = self.tokenizer.id_to_token[self.tokenizer.sep_token_id]
+        tokens = [self.tokenizer.id_to_token[t] for t in self.sequence[1:]]
+        if tokens and tokens[-1] == sep_str:
+            return []
+
+        #   构建 「算子 → arity」 映射（含四则运算）
+        import inspect, operators
+
+        op_arity = {"+": 2, "-": 2, "*": 2, "/": 2}
+        for name, fn in inspect.getmembers(operators, inspect.isfunction):
+            op_arity[name] = len(inspect.signature(fn).parameters)
+
+        def _delta(tok: str) -> int:
+            """token 对栈深的增量"""
+            if tok in op_arity:  # 算子
+                return 1 - op_arity[tok]
+            if tok in self.tokenizer.special_tokens:  # [BOS]/[SEP]/[PAD]
+                return 0
+            return 1  # 操作数
+
+        for tk in tokens:
+            stack_depth += _delta(tk)
+
+         # ---------- 2. 若长度已至上限-1，则只能收尾 ------------------------------
+        if len(self.sequence) >= self.max_len - 1:
+            return [self.tokenizer.sep_token_id]
+
+        # ---------- 3. 枚举所有 token，筛选合法动作 -----------------------------
+        valid: List[int] = []
+        remaining_steps = self.max_len - len(self.sequence) - 1  # 预留结尾 [SEP]
+
+        for tid in range(self.tokenizer.vocab_size):
+            tok = self.tokenizer.id_to_token[tid]
+
+            # 跳过无意义或禁止的特殊标记
+            if tok in ("[BOS]", "[PAD]"):
+                continue
+
+            # ---- A. 结束符 `[SEP]` ----
+            if tok == "[SEP]":
+                if stack_depth == 1:               # 仅当栈深恰好为 1 可收尾
+                    valid.append(tid)
+                continue
+
+            # ---- B. 普通 token ----
+            nd = stack_depth + _delta(tok)
+            # 合法性 1：中途栈深不得为负
+            if nd < 0:
+                continue
+            # 合法性 2：后续仍需有可能在剩余步数内归结到栈深 1
+            #   最悲观情形：后面全用二元算子，每步栈深 -1，再加结尾 [SEP]
+            #   所需最少步 = (nd - 1)   （降到 1） + 1（收尾）
+            if nd - 1 + 1 > remaining_steps:
+                continue
+
+            valid.append(tid)
+
+        return valid
+
+
+================================================================================
+File: .\generator.py
 --------------------------------------------------------------------------------
 from typing import List, Tuple, Dict, Any
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 from torch.distributions import Categorical
 from envs import AlphaGenerationEnv
 
@@ -542,11 +531,11 @@ class ValueNetwork(nn.Module):
         self, x: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """
-        Args:
+        参数:
             x: 输入 token 序列，形状为 (batch_size, seq_len)。
             hidden: LSTM 隐藏状态。
 
-        Returns:
+        返回值:
             value: 每个序列的状态价值，形状为 (batch_size,)。
             hidden: 更新后的隐藏状态。
         """
@@ -570,12 +559,12 @@ class ValueNetwork(nn.Module):
 
 class RLAlphaGenerator:
     """
-    使用 PPO 在 AlphaGenerationEnv 上训练生成 alpha 表达式的策略。
+    使用 PPO 在 `AlphaGenerationEnv` 中训练策略网络，自动生成高 IC 的 Alpha 表达式。
     """
 
     def __init__(self, env: AlphaGenerationEnv, config: Dict[str, Any]) -> None:
         """
-        Args:
+        参数:
             env: 强化学习环境，需支持 reset(), step(action), valid_actions() 接口。
             config: 包含网络和 PPO 超参数的配置字典。
         """
@@ -603,15 +592,70 @@ class RLAlphaGenerator:
         self.update_epochs = config.get("update_epochs", 4)
         self.batch_size = config.get("batch_size", 64)
         self.max_seq_len = config.get("max_seq_len", 20)
-
+    
     def train(self, num_iterations: int) -> None:
         """
-        运行 PPO 训练循环，更新策略和值函数。
-
-        Args:
-            num_iterations: 训练轮数，每轮会进行一次 trajectory 收集与 PPO 更新。
+        用 PPO 训练策略 & 价值网络。
+        每轮：
+          ① 与环境交互，采样 batch_size 步（或更多）完整 episode
+          ② 计算优势 (A = R - V) 并标准化
+          ③ 对策略 / 价值网络做多次 epoch 更新
         """
-        ...
+        for it in range(1, num_iterations + 1):
+            # ------ 采样轨迹 -------------------------------------------------
+            states, actions, old_logps, returns, advantages = self._collect_trajectories()
+
+            # Advantage 标准化以稳定训练
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            # 打包成 DataLoader，方便多轮 epoch shuffle
+            ds = TensorDataset(states, actions, old_logps, returns, advantages)
+            loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
+
+            for _ in range(self.update_epochs):
+                for s, a, logp_old, ret, adv in loader:
+                    s = s.to(self.device)
+                    a = a.to(self.device)
+                    logp_old = logp_old.to(self.device).detach()
+                    ret = ret.to(self.device)
+                    adv = adv.to(self.device)
+
+                    # ----- 1. 重新计算策略 & log π(a|s) ---------------------
+                    h0_p = self.policy_net.init_hidden(s.size(0), self.device)
+                    logits, _ = self.policy_net(s, h0_p)
+                    dist = Categorical(logits=logits)
+                    logp = dist.log_prob(a)
+                    entropy = dist.entropy().mean()
+
+                    # ----- 2. 计算 PPO clip 损失 ---------------------------
+                    ratio = (logp - logp_old).exp()
+                    pg_loss = -torch.min(
+                        ratio * adv,
+                        torch.clamp(ratio, 1 - self.clip_eps, 1 + self.clip_eps) * adv,
+                    ).mean()
+
+                    # ----- 3. 计算价值函数损失 -----------------------------
+                    h0_v = self.value_net.init_hidden(s.size(0), self.device)
+                    value_pred, _ = self.value_net(s, h0_v)
+                    value_loss = F.mse_loss(value_pred.squeeze(-1), ret)
+
+                    # ----- 4. 总损失 & 反向传播 ----------------------------
+                    loss = pg_loss + self.value_coef * value_loss - self.entropy_coef * entropy
+
+                    self.policy_optimizer.zero_grad()
+                    self.value_optimizer.zero_grad()
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.policy_net.parameters(), 1.0)
+                    torch.nn.utils.clip_grad_norm_(self.value_net.parameters(), 1.0)
+                    self.policy_optimizer.step()
+                    self.value_optimizer.step()
+
+            # ------ 打印监控信息 --------------------------------------------
+            if it % 10 == 0:
+                with torch.no_grad():
+                    avg_ret = returns.mean().item()
+                    combo_ic = self.env.combo_model.score()
+                print(f"[Iter {it:04d}]  AvgReturn={avg_ret:+.4f}   ComboIC={combo_ic:+.4f}")
 
     def _collect_trajectories(
         self,
@@ -619,14 +663,20 @@ class RLAlphaGenerator:
         List[torch.Tensor], List[int], List[torch.Tensor], List[float], List[float]
     ]:
         """
-        从环境中采样若干条完整轨迹，用于 PPO 更新。
+        从环境中采样一批完整轨迹，并计算回报与优势值（GAE λ=1）。
 
-        Returns:
-            states: token 序列 (List[Tensor])。
-            actions: 选择的动作 token_id (List[int])。
-            logps: 对应动作的 log 概率 (List[Tensor])。
-            returns: 每个步骤对应的回报值 (List[float])。
-            advantages: 每个步骤的 advantage（此处为简化直接用 return）。
+        返回
+        ----------
+        states : torch.Tensor
+            形状 ``(T, seq_len)`` 的 token 序列张量。
+        actions : torch.Tensor
+            长度 ``T`` 的动作 ID。
+        logps : torch.Tensor
+            对应动作的对数概率。
+        returns : torch.Tensor
+            折现回报。
+        advantages : torch.Tensor
+            Advantage 值（此处为 `return - value`）。
         """
         states, actions, logps, rewards, dones, values = [], [], [], [], [], []
 
@@ -637,14 +687,16 @@ class RLAlphaGenerator:
             logits, h_p = self.policy_net(obs, h_p)
 
             # -------- Invalid-action-mask --------
-            mask = torch.tensor([self.env.action_mask()], device=self.device)
-            logits[mask == 0] = -1e9
+            valid = self.env.valid_actions()
+            mask = torch.full((self.vocab_size,), float('-inf'), device=self.device)
+            mask[valid] = 0.0                                # 合法动作设置成 0，其它仍为 −inf
+            logits = logits + mask                          # 非法动作 logits 变为 −inf
             dist = Categorical(logits=logits)
             
             action = dist.sample()
             logp = dist.log_prob(action)
 
-            value, h_v = self.value_net(action)
+            value, h_v = self.value_net(obs, h_v)
 
             next_obs, reward, done, _ = self.env.step(action.item())
             states.append(obs.squeeze(0))
@@ -678,45 +730,7 @@ class RLAlphaGenerator:
     
 
 ================================================================================
-File: ./paradigm.py
---------------------------------------------------------------------------------
-import numpy as np
-
-# alpha_mining_framework/
-# ├── __init__.py
-# ├── data.py            # Data loading & preprocessing
-# ├── utils.py           # Metrics: IC, RankIC, normalization, caching
-# ├── combination.py     # AlphaCombinationModel: linear combine + weight optimization
-# ├── env.py             # AlphaGenerationEnv: custom RL environment without gym
-# ├── generator.py       # RLAlphaGenerator: PPO policy & value networks
-# ├── train.py           # Main training loop implementing Algorithm 2
-# └── run_backtest.py    # Backtesting & investment simulation (Figure 5)
-
-
-
-
-
-
-================================================================================
-File: ./train.py
---------------------------------------------------------------------------------
-# train.py
-from combination import AlphaCombinationModel
-from envs import AlphaGenerationEnv
-from generator import RLAlphaGenerator
-
-if __name__ == "__main__":
-    # 1. Load data
-    # 2. Initialize AlphaCombinationModel
-    # 3. Initialize tokenizer 和 AlphaGenerationEnv
-    # 4. Initialize RLAlphaGenerator
-    # 5. 调用 generator.train()
-    # 6. 保存发现的 alphas 和权重
-    pass
-
-
-================================================================================
-File: ./operators.py
+File: .\operators.py
 --------------------------------------------------------------------------------
 import pandas as pd
 import numpy as np
@@ -816,21 +830,277 @@ def ts_return(series: pd.Series, period: int = 1) -> pd.Series:
 
 
 ================================================================================
-File: ./data.py
+File: .\paradigm.py
 --------------------------------------------------------------------------------
-# data.py 
+import numpy as np
 
+# alpha_mining_framework/
+# ├── __init__.py
+# ├── data.py            # Data loading & preprocessing
+# ├── utils.py           # Metrics: IC, RankIC, normalization, caching
+# ├── combination.py     # AlphaCombinationModel: linear combine + weight optimization
+# ├── env.py             # AlphaGenerationEnv: custom RL environment without gym
+# ├── generator.py       # RLAlphaGenerator: PPO policy & value networks
+# ├── train.py           # Main training loop implementing Algorithm 2
+# └── run_backtest.py    # Backtesting & investment simulation (Figure 5)
+
+
+
+
+
+
+================================================================================
+File: .\tokenizer.py
+--------------------------------------------------------------------------------
+# tokenizer.py
+import re
+import inspect
+import operators
+from typing import List, Dict
+
+class AlphaTokenizer:
+    """
+    将逆波兰表达式 (RPN) 与 token 序列相互映射的分词器。
+
+    - **词表**：基础行情字段、常量桶、所有算子以及四则运算符  
+    - **特殊标记**：`[PAD]` 填充、`[BOS]` 序列起始、`[SEP]` 序列终止
+    """
+    def __init__(self, base_fields: List[str] = None, const_buckets: List[float] = None):
+        """
+        构造分词器并自动扫描 `operators.py` 生成完整词表。
+
+        参数
+        ----------
+        base_fields : list[str], 可选
+            基础行情字段名称列表，默认为  
+            ``['open', 'high', 'low', 'close', 'volume']``。
+        const_buckets : list[float], 可选
+            预定义浮点常量桶，默认为  
+            ``[1, 3, 5, 10, 20, 0.1, 0.5]``。
+        """
+        if base_fields is None:
+            base_fields = ['open', 'high', 'low', 'close', 'volume']
+        if const_buckets is None:
+            const_buckets = [1, 3, 5, 10, 20, 0.1, 0.5]
+
+        self.base_fields = base_fields
+        self.const_buckets = const_buckets
+
+        # 特殊 token
+        self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
+
+        # 基础字段 token
+        field_tokens = base_fields
+
+        # 常量 token
+        const_tokens = [f'CONST_{c}' for c in const_buckets]
+
+        # 算子 token：自动扫描 operators.py
+        op_tokens = []
+        for name, fn in inspect.getmembers(operators, inspect.isfunction):
+            if not name.startswith("_"):
+                op_tokens.append(name)
+
+        # 词表
+        arith = ['+', '-', '*', '/']
+        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens + arith
+
+        # ID ↔ Token 映射
+        self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
+        self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
+
+        # 便捷属性
+        self.pad_token_id = self.token_to_id['[PAD]']
+        self.bos_token_id = self.token_to_id['[BOS]']
+        self.sep_token_id = self.token_to_id['[SEP]']
+
+    @property
+    def vocab_size(self) -> int:
+        """
+        返回当前词表大小。
+
+        返回
+        ----------
+        int
+            ``len(self.vocab)``。
+        """
+        return len(self.vocab)
+
+    def encode(self, expr: str, add_special_tokens: bool = True) -> List[int]:
+        """
+        将 RPN 字符串编码为 token ID 序列。
+
+        参数
+        ----------
+        expr : str
+            形如 ``"close 5 ts_mean"`` 的逆波兰表达式。
+        add_special_tokens : bool, 可选
+            是否在首尾分别加入 `[BOS]` 与 `[SEP]`，默认为 ``True``。
+
+        返回
+        ----------
+        list[int]
+            token ID 序列。
+        """
+        tokens = expr.strip().split()
+        ids = []
+        for tk in tokens:
+            # 基础字段
+            if tk in self.token_to_id:
+                ids.append(self.token_to_id[tk])
+            # 常量：动态加入最近的 bucket
+            elif self._is_float(tk):
+                val = float(tk)
+                const_tok = self._map_to_const(val)
+                ids.append(self.token_to_id[const_tok])
+            else:
+                raise ValueError(f"未知 token：{tk}")
+
+        if add_special_tokens:
+            ids = [self.bos_token_id] + ids + [self.sep_token_id]
+        return ids
+
+    def decode(self, ids: List[int], remove_special_tokens: bool = True) -> str:
+        """
+        将 token ID 序列还原为 RPN 字符串。
+
+        参数
+        ----------
+        ids : list[int]
+            编码后的 token ID 列表。
+        remove_special_tokens : bool, 可选
+            是否去除 `[BOS]` / `[SEP]` / `[PAD]`，默认为 ``True``。
+
+        返回
+        ----------
+        str
+            逆波兰表达式，常量会被还原为原始数字字符串。
+        """
+        toks = []
+        for idx in ids:
+            if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
+                continue
+            toks.append(self.id_to_token.get(idx, 'UNK'))
+        # 常量还原
+        toks = [self._const_to_str(tk) for tk in toks]
+        return " ".join(toks)
+
+    def _map_to_const(self, val: float) -> str:
+        """
+        将任意浮点数映射到最近的常量桶，并返回其 token 名。
+
+        参数
+        ----------
+        val : float
+            原始浮点数。
+
+        返回
+        ----------
+        str
+            形如 ``"CONST_5"`` 的 token 名称。
+        """
+        closest = min(self.const_buckets, key=lambda x: abs(x - val))
+        return f'CONST_{closest}'
+
+    def _const_to_str(self, token: str) -> str:
+        """
+        将常量 token 名恢复为数字字符串。
+
+        参数
+        ----------
+        token : str
+            形如 ``"CONST_3"`` 的 token。
+
+        返回
+        ----------
+        str
+            ``"3"``；如果传入非常量 token，则原样返回。
+        """
+        if token.startswith('CONST_'):
+            return token.split('_', 1)[1]
+        return token
+
+    @staticmethod
+    def _is_float(s: str) -> bool:
+        """
+        判断字符串能否安全转换为 `float`。
+
+        参数
+        ----------
+        s : str
+            待检测字符串。
+
+        返回
+        ----------
+        bool
+            可转换返回 ``True``，否则 ``False``。
+        """
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
+
+
+================================================================================
+File: .\train.py
+--------------------------------------------------------------------------------
+# train.py
+from combination import AlphaCombinationModel
+from envs import AlphaGenerationEnv
+from generator import RLAlphaGenerator
+
+if __name__ == "__main__":
+    # 1. Load data
+    # 2. Initialize AlphaCombinationModel
+    # 3. Initialize tokenizer 和 AlphaGenerationEnv
+    # 4. Initialize RLAlphaGenerator
+    # 5. 调用 generator.train()
+    # 6. 保存发现的 alphas 和权重
+    pass
+
+
+================================================================================
+File: .\utility.py
+--------------------------------------------------------------------------------
+# utility.py
+
+import numpy as np
 import pandas as pd
 
-
-def load_market_data(path: str = "rb_20250606_primary.csv"):
+def zscore_normalize(series: pd.Series) -> pd.Series:
     """
-    Load and= preprocess raw A-share market data.
-    Returns: DataFrame with features and target 20-day returns.
+    Z-score 标准化处理：消除因子的尺度影响
     """
-    # TODO: 这里暂时读取本地文件
+    mean = series.mean()
+    std = series.std()
+    if std == 0 or np.isnan(std):
+        return pd.Series(np.zeros_like(series), index=series.index)
+    return (series - mean) / std
 
-    df = pd.read_csv(path)
-    return df
+def winsorize(series: pd.Series, lower_quantile: float = 0.01, upper_quantile: float = 0.99) -> pd.Series:
+    """
+    异常值截断处理：防止 outlier 扰动因子稳定性
+    """
+    lower = series.quantile(lower_quantile)
+    upper = series.quantile(upper_quantile)
+    return series.clip(lower=lower, upper=upper)
+
+def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
+    """
+    信息系数（IC）：衡量因子预测未来收益的能力，Pearson 相关系数
+    """
+    if len(factor) != len(target):
+        raise ValueError("Factor and target length mismatch")
+    if np.std(factor) == 0 or np.std(target) == 0:
+        return 0.0
+    
+    ic = np.corrcoef(factor, target)[0, 1]
+    return float(np.nan_to_num(ic))
+
+================================================================================
+File: .\__init__.py
+--------------------------------------------------------------------------------
 
 
