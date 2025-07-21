@@ -1,0 +1,836 @@
+================================================================================
+File: ./envs.py
+--------------------------------------------------------------------------------
+# env.py
+from combination import AlphaCombinationModel
+from typing import List
+
+class AlphaGenerationEnv:
+    """
+    自定义强化学习环境，无需依赖 OpenAI Gym。
+    State: token ID 序列
+    Action: 下一个 token ID
+    Reward: 表达式结束时组合模型返回的 IC
+    """
+    def __init__(self, combo_model, tokenizer, max_len=20):
+        self.combo_model = combo_model
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.reset()
+
+    def reset(self):
+        self.sequence = [self.tokenizer.bos_token_id]
+        self.done = False
+        return self._get_obs()
+
+    def step(self, action: int):
+        self.sequence.append(action)
+        token = self.tokenizer.decode([action])
+        reward = 0.0
+        if token == self.tokenizer.sep_token or len(self.sequence) >= self.max_len:
+            expr = self.tokenizer.decode(self.sequence[1:-1])
+            reward = self.combo_model.evaluate_alpha(expr)
+            self.done = True
+        obs = self._get_obs()
+        return obs, reward, self.done, {}
+
+    def _get_obs(self):
+        # 返回 list[int]；PPO 里再转 tensor
+        return self.sequence
+    
+    def valid_actions(self) -> List[int]:
+        """
+        返回当前状态下合法 token_id 的列表，用于 Invalid-Action-Mask。
+        简化实现：只防止过长 & 必须以 sep 终止；更细规则见 Appendix C。
+        """
+        if self.done:
+            return []                      # episode 已结束
+        if len(self.sequence) >= self.max_len - 1:
+            return [self.tokenizer.sep_token_id]  # 只能收尾
+        # 否则全部 token 都可选
+        return list(range(self.tokenizer.vocab_size))
+    
+
+
+
+================================================================================
+File: ./utility.py
+--------------------------------------------------------------------------------
+# utility.py
+
+import numpy as np
+import pandas as pd
+
+def zscore_normalize(series: pd.Series) -> pd.Series:
+    """
+    Z-score 标准化处理：消除因子的尺度影响
+    """
+    mean = series.mean()
+    std = series.std()
+    if std == 0 or np.isnan(std):
+        return pd.Series(np.zeros_like(series), index=series.index)
+    return (series - mean) / std
+
+def winsorize(series: pd.Series, lower_quantile: float = 0.01, upper_quantile: float = 0.99) -> pd.Series:
+    """
+    异常值截断处理：防止 outlier 扰动因子稳定性
+    """
+    lower = series.quantile(lower_quantile)
+    upper = series.quantile(upper_quantile)
+    return series.clip(lower=lower, upper=upper)
+
+def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
+    """
+    信息系数（IC）：衡量因子预测未来收益的能力，Pearson 相关系数
+    """
+    if len(factor) != len(target):
+        raise ValueError("Factor and target length mismatch")
+    if np.std(factor) == 0 or np.std(target) == 0:
+        return 0.0
+    
+    ic = np.corrcoef(factor, target)[0, 1]
+    return float(np.nan_to_num(ic))
+
+================================================================================
+File: ./__init__.py
+--------------------------------------------------------------------------------
+
+
+================================================================================
+File: ./combination.py
+--------------------------------------------------------------------------------
+# combination.py
+import numpy as np
+from utility import zscore_normalize, winsorize, information_coefficient
+from scipy.optimize import minimize
+from typing import List, Dict, Union, Tuple, Callable
+import operators
+import pandas as pd
+import inspect
+
+class AlphaCombinationModel:
+    """
+    因子线性组合管理器，实现论文中算法1的核心思想。
+
+    功能：
+    1. 维护一个最多包含 max_pool_size 条归一化因子序列的因子池。
+    2. 每当有新因子生成时，对其进行截尾与 Z-score 归一化，并计算信息系数（IC）。
+    3. 将新因子加入因子池后，使用凸优化求解最优线性权重，以最大化组合 IC。
+    4. 如果因子池大小超出上限，则剔除对组合贡献最小的因子。
+    5. 对中间计算（归一化序列、IC 值、权重解等）进行缓存，避免重复开销。
+    """
+    def __init__(self, max_pool_size: int = 50):
+        """
+        初始化因子组合模型。
+
+        参数：
+        - max_pool_size：因子池最大容量，超过后会剔除贡献度最低的因子。
+        """
+        self.max_pool_size = max_pool_size
+        self.alphas = []         # 原始因子序列列表
+        self.norm_alphas = []    # 归一化后的因子序列列表
+        self.ic_list = []        # 对应的单因子 IC 值列表
+        self.weights = []        # 当前组合的线性权重列表
+        self._cache = {}         # 缓存字典，用于存储中间结果
+        self.expr_list = []      # 新增：对应每条因子的 RPN 表达式字符串
+
+    def inject_data(self, df: pd.DataFrame, target_col) -> None:
+        """
+        在主程序中加载好行情后，把 df 注入模型，
+        target_col 是未来收益列，用于计算 IC。
+        """
+        self.data: pd.DataFrame = df
+        self._target = df[target_col].values.astype(np.float64)
+
+    def update_with(self, new_alpha: np.ndarray, expr: str):
+        """
+        添加并更新新因子至因子池，同时保存其表达式。
+
+        步骤：
+        1. 对 new_alpha 做 winsorize 截尾与 z-score 归一化。
+        2. 计算该因子的单因子 IC，并缓存结果。
+        3. 将归一化因子与其 IC 加入池中，重新求解最优权重。
+        4. 若因子池超限，剔除 |w·IC| 最小的那个因子。
+
+        参数：
+        - new_alpha：原始因子值数组（numpy）。
+        - expr     ：该因子对应的 RPN 表达式字符串。
+        """
+        # 归一化
+        norm = winsorize(zscore_normalize(new_alpha))
+        key = ('ic', tuple(norm))
+        if key in self._cache:
+            ic = self._cache[key]
+        else:
+            target = self._load_validation_target()
+            ic = information_coefficient(norm, target)
+            self._cache[key] = ic
+
+        # 更新因子池
+        self.alphas.append(new_alpha)
+        self.norm_alphas.append(norm)
+        self.ic_list.append(ic)
+        self.expr_list.append(expr)          # 记录表达式
+
+        # 若是首因子直接赋权 1；否则重优化权重
+        if len(self.norm_alphas) == 1:
+            self.weights = [1.0]
+        else:
+            self._reoptimize_weights()
+
+        # 超限时剔除贡献最小因子
+        if len(self.alphas) > self.max_pool_size:
+            contrib = [abs(w * ic) for w, ic in zip(self.weights, self.ic_list)]
+            idx = contrib.index(min(contrib))
+            for lst in (self.alphas, self.norm_alphas, self.ic_list, self.weights):
+                lst.pop(idx)
+
+    def add_alpha_expr(self, expr: str) -> float:
+        """
+        根据表达式计算因子、IC，并把它加入因子池。
+        返回该因子的单因子 IC，方便上层当作 reward 使用。
+        """
+        new_alpha = self._compute_alpha_from_expr(expr)
+        ic = self.evaluate_alpha(expr)            # 里面自带缓存
+        self.update_with(new_alpha, expr)
+        return ic
+
+    def _reoptimize_weights(self):
+        """
+        求解最优线性权重，使组合 IC 最大。
+
+        实现细节：
+        - 目标：最小化负的组合 IC。
+        - 约束：权重绝对值之和等于 1（L1 归一化）。
+        - 求解器：使用 scipy.optimize.minimize，默认 SLSQP 方法。
+        """
+        A = np.vstack(self.norm_alphas).T
+        target = self._load_validation_target()
+
+        def objective(w):
+            combo = A.dot(w)
+            ic = np.corrcoef(combo, target)[0, 1]
+            return -np.nan_to_num(ic)
+
+        cons = ({'type': 'eq', 'fun': lambda w: np.sum(np.abs(w)) - 1})
+        x0 = np.ones(A.shape[1]) / A.shape[1]
+        res = minimize(objective, x0, constraints=cons, method='SLSQP')
+        self.weights = res.x.tolist()
+        self._cache['weights'] = res.x.copy()
+
+    def evaluate_alpha(self, expr: str) -> float:
+        """
+        根据给定的表达式（RPN 格式）计算原始因子序列，
+        然后做归一化并返回其单因子 IC（带缓存）。
+
+        参数：
+        - expr：因子表达式（逆波兰表示法字符串）。
+
+        返回：
+        - 该表达式对应因子的 IC 值。
+        """
+        new_alpha = self._compute_alpha_from_expr(expr)
+        norm = self._maybe_normalize(new_alpha)
+        key = ('expr_ic', expr)
+        if key not in self._cache:
+            target = self._load_validation_target()
+            self._cache[key] = information_coefficient(norm, target)
+        return self._cache[key]
+
+    def score(self) -> float:
+        """
+        计算并返回当前加权组合在验证集上的信息系数（IC）。
+
+        返回：
+        - 组合因子的 IC。
+        """
+        A = np.vstack(self.norm_alphas).T
+        combo = A.dot(np.array(self.weights))
+        target = self._load_validation_target()
+        return information_coefficient(combo, target)
+
+    def _load_validation_target(self) -> np.ndarray:
+        """
+        加载验证集的目标序列（如未来收益或方向标签）。
+        该方法需由用户实现以接入实际数据。
+        """
+        if not hasattr(self, "_target"):
+            raise AttributeError("请先调用 inject_data() 注入行情和目标序列")
+        return self._target
+
+    def _compute_alpha_from_expr(self, expr: str) -> np.ndarray:
+        """
+        解析 RPN 表达式并返回对应的 numpy.ndarray 因子序列。
+
+        设计约定
+        ----------
+        • 基础变量：直接写列名，例如 'close'、'volume'；必须存在于 self.data 中  
+        • 常量      ：写成数字字符串，如 '5'、'0.3'，自动转 float  
+        • 一元/二元/多元算子：对应 operators.py 中的函数名，例如
+              "close 5 ts_mean"    # → ts_mean(close, 5)
+              "high low - ts_max"  # → ts_max(high - low)
+              "open close ts_corr 20" # → ts_corr(open, close, 20)
+        • 每个函数的“参数个数” (= arity) 通过反射自动推断，兼容新算子零改动
+        """
+        if not hasattr(self, "data"):
+            raise AttributeError(
+                "AlphaCombinationModel 需先注入行情 DataFrame 到 self.data"
+            )
+
+        tokens: List[str] = expr.strip().split()
+        stack: List[Union[pd.Series, float]] = []
+
+        # 预构建 “函数名 → (Callable, arity)” 映射
+        func_map: Dict[str, Tuple[Callable, int]] = {}
+        for name, fn in inspect.getmembers(operators, inspect.isfunction):
+            sig = inspect.signature(fn)
+            func_map[name] = (fn, len(sig.parameters))
+
+        for tk in tokens:
+            # -- 1. 基础变量 ----------------------------------------------------
+            if tk in self.data.columns:
+                stack.append(self.data[tk])
+            # -- 2. 数值常量 ----------------------------------------------------
+            elif _is_float(tk):
+                stack.append(float(tk))
+            # -- 3. 函数 / 运算符 ----------------------------------------------
+            elif tk in func_map:
+                fn, arity = func_map[tk]
+                if len(stack) < arity:
+                    raise ValueError(f"RPN 表达式参数不足：{tk}")
+                # 注意：弹栈顺序需反转以保持原来顺序
+                args = [stack.pop() for _ in range(arity)][::-1]
+                res = fn(*args)
+                stack.append(res)
+            # -- 4. 支持最常见的四则运算符 -------------------------------------
+            elif tk in {"+", "-", "*", "/"}:
+                if len(stack) < 2:
+                    raise ValueError(f"RPN 表达式参数不足：{tk}")
+                b, a = stack.pop(), stack.pop()
+                if tk == "+": res = a + b
+                elif tk == "-": res = a - b
+                elif tk == "*": res = a * b
+                elif tk == "/": res = a / (b.replace(0, np.nan) if isinstance(b, pd.Series) else (b if b != 0 else np.nan))
+                stack.append(res)
+            else:
+                raise ValueError(f"未知 token：{tk}")
+
+        if len(stack) != 1:
+            raise ValueError("RPN 表达式最终栈深度应为 1")
+        # 返回 numpy 数组，后续会做 winsorize + z-score
+        series = stack[0]
+        return np.asarray(series.values, dtype=np.float64)
+    
+    def _maybe_normalize(self, alpha: np.ndarray) -> np.ndarray:
+        """
+        对原始因子序列执行 winsorize 截尾和 z-score 归一化。
+        """
+        return winsorize(zscore_normalize(alpha))
+
+        # === 1. RPN 解析与执行 ====================================================
+
+
+def _is_float(str) -> bool:
+    """
+    判断字符串 s 是否能被转换成 float。
+    返回 True 表示可以, False 表示不行。
+    """
+    try:
+        float(str)
+        return True
+    except ValueError:
+        return False
+
+================================================================================
+File: ./tokenizer.py
+--------------------------------------------------------------------------------
+# tokenizer.py
+import re
+import inspect
+import operators
+from typing import List, Dict
+
+class AlphaTokenizer:
+    """
+    将 RPN 表达式（如 'close 5 ts_mean'）转化为 token ID 序列。
+    """
+    def __init__(self, base_fields: List[str] = None, const_buckets: List[float] = None):
+        """
+        Args:
+            base_fields: 基础行情字段列表，例如 ['open', 'high', 'low', 'close', 'volume']
+            const_buckets: 预定义常量列表，例如 [1, 3, 5, 10, 20]
+        """
+        if base_fields is None:
+            base_fields = ['open', 'high', 'low', 'close', 'volume']
+        if const_buckets is None:
+            const_buckets = [1, 3, 5, 10, 20, 0.1, 0.5]
+
+        self.base_fields = base_fields
+        self.const_buckets = const_buckets
+
+        # 特殊 token
+        self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
+
+        # 基础字段 token
+        field_tokens = base_fields
+
+        # 常量 token
+        const_tokens = [f'CONST_{c}' for c in const_buckets]
+
+        # 算子 token：自动扫描 operators.py
+        op_tokens = []
+        for name, fn in inspect.getmembers(operators, inspect.isfunction):
+            if not name.startswith("_"):
+                op_tokens.append(name)
+
+        # 词表
+        arith = ['+', '-', '*', '/']
+        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens + arith
+
+        # ID ↔ Token 映射
+        self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
+        self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
+
+        # 便捷属性
+        self.pad_token_id = self.token_to_id['[PAD]']
+        self.bos_token_id = self.token_to_id['[BOS]']
+        self.sep_token_id = self.token_to_id['[SEP]']
+
+    @property
+    def vocab_size(self) -> int:
+        return len(self.vocab)
+
+    def encode(self, expr: str, add_special_tokens: bool = True) -> List[int]:
+        """
+        将 RPN 表达式编码为 token ID 序列。
+        """
+        tokens = expr.strip().split()
+        ids = []
+        for tk in tokens:
+            # 基础字段
+            if tk in self.token_to_id:
+                ids.append(self.token_to_id[tk])
+            # 常量：动态加入最近的 bucket
+            elif self._is_float(tk):
+                val = float(tk)
+                const_tok = self._map_to_const(val)
+                ids.append(self.token_to_id[const_tok])
+            else:
+                raise ValueError(f"未知 token：{tk}")
+
+        if add_special_tokens:
+            ids = [self.bos_token_id] + ids + [self.sep_token_id]
+        return ids
+
+    def decode(self, ids: List[int], remove_special_tokens: bool = True) -> str:
+        """
+        将 token ID 序列解码为 RPN 表达式。
+        """
+        toks = []
+        for idx in ids:
+            if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
+                continue
+            toks.append(self.id_to_token.get(idx, 'UNK'))
+        # 常量还原
+        toks = [self._const_to_str(tk) for tk in toks]
+        return " ".join(toks)
+
+    def _map_to_const(self, val: float) -> str:
+        """
+        将任意浮点数映射到最近的常量 bucket。
+        """
+        closest = min(self.const_buckets, key=lambda x: abs(x - val))
+        return f'CONST_{closest}'
+
+    def _const_to_str(self, token: str) -> str:
+        """
+        将 CONST_x 还原为 x 的字符串。
+        """
+        if token.startswith('CONST_'):
+            return token.split('_', 1)[1]
+        return token
+
+    @staticmethod
+    def _is_float(s: str) -> bool:
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
+
+
+================================================================================
+File: ./generator.py
+--------------------------------------------------------------------------------
+from typing import List, Tuple, Dict, Any
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.distributions import Categorical
+from envs import AlphaGenerationEnv
+
+
+class PolicyNetwork(nn.Module):
+    def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 1) -> None:
+        """
+        策略网络，用于生成下一个 token 的概率分布。
+
+        Args:
+            vocab_size: token vocabulary 大小，即动作空间大小。
+            hidden_dim: LSTM 隐藏层维度。
+            num_layers: LSTM 层数。
+        """
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc_logits = nn.Linear(hidden_dim, vocab_size)
+
+    def forward(
+        self, x: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Args:
+            x: 输入 token 序列，形状为 (batch_size, seq_len)。
+            hidden: LSTM 的隐藏状态 (h, c)，形状为 (num_layers, batch_size, hidden_dim)。
+
+        Returns:
+            logits: 下一个 token 的 logits，形状为 (batch_size, vocab_size)。
+            hidden: 更新后的隐藏状态。
+        """
+        emb = self.embedding(x)
+        out, hidden = self.lstm(emb, hidden)
+        logits = self.fc_logits(out[:, -1, :])
+        return logits, hidden
+
+    def init_hidden(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        初始化隐藏状态为全零。
+
+        Args:
+            batch_size: 批量大小。
+            device: 所在设备（cpu 或 cuda）。
+
+        Returns:
+            初始化的 (h, c) 状态。
+        """
+        num_layers = self.lstm.num_layers
+        hidden_dim = self.lstm.hidden_size
+        h0 = torch.zeros(num_layers, batch_size, hidden_dim, device=device)
+        c0 = torch.zeros(num_layers, batch_size, hidden_dim, device=device)
+        return (h0, c0)
+
+
+class ValueNetwork(nn.Module):
+    def __init__(self, vocab_size: int, hidden_dim: int, num_layers: int = 1) -> None:
+        """
+        价值网络，用于估计当前 token 序列的状态价值 V(s)
+
+        Args:
+            vocab_size: token vocabulary 大小。
+            hidden_dim: LSTM 隐藏层维度。
+            num_layers: LSTM 层数。
+        """
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, hidden_dim)
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, num_layers, batch_first=True)
+        self.fc_value = nn.Linear(hidden_dim, 1)
+
+    def forward(
+        self, x: torch.Tensor, hidden: Tuple[torch.Tensor, torch.Tensor]
+    ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        Args:
+            x: 输入 token 序列，形状为 (batch_size, seq_len)。
+            hidden: LSTM 隐藏状态。
+
+        Returns:
+            value: 每个序列的状态价值，形状为 (batch_size,)。
+            hidden: 更新后的隐藏状态。
+        """
+        emb = self.embedding(x)
+        out, hidden = self.lstm(emb, hidden)
+        value = self.fc_value(out[:, -1, :]).squeeze(-1)
+        return value, hidden
+
+    def init_hidden(
+        self, batch_size: int, device: torch.device
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        同 PolicyNetwork，初始化 LSTM 隐藏状态。
+        """
+        num_layers = self.lstm.num_layers
+        hidden_dim = self.lstm.hidden_size
+        h0 = torch.zeros(num_layers, batch_size, hidden_dim, device=device)
+        c0 = torch.zeros(num_layers, batch_size, hidden_dim, device=device)
+        return (h0, c0)
+
+
+class RLAlphaGenerator:
+    """
+    使用 PPO 在 AlphaGenerationEnv 上训练生成 alpha 表达式的策略。
+    """
+
+    def __init__(self, env: AlphaGenerationEnv, config: Dict[str, Any]) -> None:
+        """
+        Args:
+            env: 强化学习环境，需支持 reset(), step(action), valid_actions() 接口。
+            config: 包含网络和 PPO 超参数的配置字典。
+        """
+        self.env = env
+        self.vocab_size = config["vocab_size"]
+        self.hidden_dim = config.get("hidden_dim", 128)
+        self.device = config.get("device", "cpu")
+
+        self.policy_net = PolicyNetwork(self.vocab_size, self.hidden_dim).to(
+            self.device
+        )
+        self.value_net = ValueNetwork(self.vocab_size, self.hidden_dim).to(self.device)
+
+        self.policy_optimizer = torch.optim.AdamW(
+            self.policy_net.parameters(), lr=config.get("lr_policy", 3e-4)
+        )
+        self.value_optimizer = torch.optim.AdamW(
+            self.value_net.parameters(), lr=config.get("lr_value", 1e-3)
+        )
+
+        self.gamma = config.get("gamma", 1.0)
+        self.clip_eps = config.get("clip_eps", 0.2)
+        self.entropy_coef = config.get("entropy_coef", 0.01)
+        self.value_coef = config.get("value_coef", 0.5)
+        self.update_epochs = config.get("update_epochs", 4)
+        self.batch_size = config.get("batch_size", 64)
+        self.max_seq_len = config.get("max_seq_len", 20)
+
+    def train(self, num_iterations: int) -> None:
+        """
+        运行 PPO 训练循环，更新策略和值函数。
+
+        Args:
+            num_iterations: 训练轮数，每轮会进行一次 trajectory 收集与 PPO 更新。
+        """
+        ...
+
+    def _collect_trajectories(
+        self,
+    ) -> Tuple[
+        List[torch.Tensor], List[int], List[torch.Tensor], List[float], List[float]
+    ]:
+        """
+        从环境中采样若干条完整轨迹，用于 PPO 更新。
+
+        Returns:
+            states: token 序列 (List[Tensor])。
+            actions: 选择的动作 token_id (List[int])。
+            logps: 对应动作的 log 概率 (List[Tensor])。
+            returns: 每个步骤对应的回报值 (List[float])。
+            advantages: 每个步骤的 advantage（此处为简化直接用 return）。
+        """
+        states, actions, logps, rewards, dones, values = [], [], [], [], [], []
+
+        obs = torch.tensor([self.env.reset()], device=self.device)
+        h_p, h_v = self.policy_net.init_hidden(1, self.device), self.value_net.init_hidden(1, self.device)
+
+        while len(states) < self.batch_size:
+            logits, h_p = self.policy_net(obs, h_p)
+
+            # -------- Invalid-action-mask --------
+            mask = torch.tensor([self.env.action_mask()], device=self.device)
+            logits[mask == 0] = -1e9
+            dist = Categorical(logits=logits)
+            
+            action = dist.sample()
+            logp = dist.log_prob(action)
+
+            value, h_v = self.value_net(action)
+
+            next_obs, reward, done, _ = self.env.step(action.item())
+            states.append(obs.squeeze(0))
+            actions.append(action)
+            logps.append(logp)
+            rewards.append(torch.tensor(reward, device=self.device, dtype=torch.float32))
+            dones.append(done)
+            values.append(value.squeeze(0))
+
+            if done:
+                obs = torch.tensor([self.env.reset()], device=self.device)
+                h_p, h_v = self.policy_net.init_hidden(1, self.device), self.value_net.init_hidden(1, self.device)
+            else:
+                obs = torch.tensor([next_obs], device=self.device)
+        
+        # ===== 计算 GAE(λ=1) → advantage = return - value =====
+        returns, advantages, R = [], [], torch.tensor(0.0, device=self.device)
+        for r, v, d in zip(reversed(rewards), reversed(values), reversed(dones)):
+            R = r + self.gamma * R * (1.0 - float(d))
+            returns.insert(0, R)
+            advantages.insert(0, R - v)
+        
+        return (
+            torch.stack(states),
+            torch.stack(actions).squeeze(-1),
+            torch.stack(logps),
+            torch.stack(returns),
+            torch.stack(advantages),
+        )
+    
+    
+
+================================================================================
+File: ./paradigm.py
+--------------------------------------------------------------------------------
+import numpy as np
+
+# alpha_mining_framework/
+# ├── __init__.py
+# ├── data.py            # Data loading & preprocessing
+# ├── utils.py           # Metrics: IC, RankIC, normalization, caching
+# ├── combination.py     # AlphaCombinationModel: linear combine + weight optimization
+# ├── env.py             # AlphaGenerationEnv: custom RL environment without gym
+# ├── generator.py       # RLAlphaGenerator: PPO policy & value networks
+# ├── train.py           # Main training loop implementing Algorithm 2
+# └── run_backtest.py    # Backtesting & investment simulation (Figure 5)
+
+
+
+
+
+
+================================================================================
+File: ./train.py
+--------------------------------------------------------------------------------
+# train.py
+from combination import AlphaCombinationModel
+from envs import AlphaGenerationEnv
+from generator import RLAlphaGenerator
+
+if __name__ == "__main__":
+    # 1. Load data
+    # 2. Initialize AlphaCombinationModel
+    # 3. Initialize tokenizer 和 AlphaGenerationEnv
+    # 4. Initialize RLAlphaGenerator
+    # 5. 调用 generator.train()
+    # 6. 保存发现的 alphas 和权重
+    pass
+
+
+================================================================================
+File: ./operators.py
+--------------------------------------------------------------------------------
+import pandas as pd
+import numpy as np
+
+# -----------------------------
+# Time-Series Operators (TS)
+# -----------------------------
+
+def ref(series: pd.Series, period: int) -> pd.Series:
+    """Ref(x, t)：滞后期 t 的值"""
+    return series.shift(period)
+
+def ts_mean(series: pd.Series, window: int) -> pd.Series:
+    """Mean(x, t)：滚动均值"""
+    return series.rolling(window).mean()
+
+def ts_med(series: pd.Series, window: int) -> pd.Series:
+    """Med(x, t)：滚动中位数"""
+    return series.rolling(window).median()
+
+def ts_sum(series: pd.Series, window: int) -> pd.Series:
+    """Sum(x, t)：滚动求和"""
+    return series.rolling(window).sum()
+
+def ts_std(series: pd.Series, window: int) -> pd.Series:
+    """Std(x, t)：滚动标准差"""
+    return series.rolling(window).std()
+
+def ts_var(series: pd.Series, window: int) -> pd.Series:
+    """Var(x, t)：滚动方差"""
+    return series.rolling(window).var()
+
+def ts_max(series: pd.Series, window: int) -> pd.Series:
+    """Max(x, t)：滚动最大值"""
+    return series.rolling(window).max()
+
+def ts_min(series: pd.Series, window: int) -> pd.Series:
+    """Min(x, t)：滚动最小值"""
+    return series.rolling(window).min()
+
+def ts_mad(series: pd.Series, window: int) -> pd.Series:
+    """Mad(x, t)：滚动平均绝对偏差"""
+    return series.rolling(window).apply(
+        lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
+    )
+
+def ts_delta(series: pd.Series, period: int = 1) -> pd.Series:
+    """Delta(x, t)：与 t 期前的差值"""
+    return series.diff(period)
+
+def ts_rank(series: pd.Series, window: int) -> pd.Series:
+    """滚动排序百分位"""
+    def _rank(x):
+        return pd.Series(x).rank(pct=True).iloc[-1]
+    return series.rolling(window).apply(_rank, raw=True)
+
+def ts_corr(x: pd.Series, y: pd.Series, window: int) -> pd.Series:
+    """Corr(x, y, t)：滚动皮尔森相关系数"""
+    return x.rolling(window).corr(y)
+
+def ts_cov(x: pd.Series, y: pd.Series, window: int) -> pd.Series:
+    """Cov(x, y, t)：滚动协方差"""
+    return x.rolling(window).cov(y)
+
+def ts_wma(series: pd.Series, window: int) -> pd.Series:
+    """WMA(x, t)：滚动线性加权平均"""
+    weights = np.arange(1, window + 1)
+    return series.rolling(window).apply(
+        lambda x: np.dot(x, weights) / weights.sum(), raw=True
+    )
+
+def ts_ema(series: pd.Series, span: int) -> pd.Series:
+    """EMA(x, t)：指数移动平均（span 可理解为 t）"""
+    return series.ewm(span=span, adjust=False).mean()
+
+
+# -----------------------------
+# Utility Operators
+# -----------------------------
+
+def decay_linear(series: pd.Series, window: int) -> pd.Series:
+    """线性衰减加权平均（同 WMA）"""
+    weights = np.arange(1, window + 1)[::-1]
+    return series.rolling(window).apply(
+        lambda x: np.dot(x, weights) / weights.sum(), raw=True
+    )
+
+def ts_zscore(series: pd.Series, window: int) -> pd.Series:
+    """时序标准分"""
+    return (series - ts_mean(series, window)) / ts_std(series, window)
+
+def ts_return(series: pd.Series, period: int = 1) -> pd.Series:
+    """周期收益率"""
+    return series.pct_change(period)
+
+
+
+
+================================================================================
+File: ./data.py
+--------------------------------------------------------------------------------
+# data.py 
+
+import pandas as pd
+
+
+def load_market_data(path: str = "rb_20250606_primary.csv"):
+    """
+    Load and= preprocess raw A-share market data.
+    Returns: DataFrame with features and target 20-day returns.
+    """
+    # TODO: 这里暂时读取本地文件
+
+    df = pd.read_csv(path)
+    return df
+
+
