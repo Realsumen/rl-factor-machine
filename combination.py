@@ -11,19 +11,30 @@ class AlphaCombinationModel:
     """
     因子线性组合管理器，实现论文中算法1的核心思想。
 
-    功能：
-    1. 维护一个最多包含 max_pool_size 条归一化因子序列的因子池。
-    2. 每当有新因子生成时，对其进行截尾与 Z-score 归一化，并计算信息系数（IC）。
-    3. 将新因子加入因子池后，使用凸优化求解最优线性权重，以最大化组合 IC。
-    4. 如果因子池大小超出上限，则剔除对组合贡献最小的因子。
-    5. 对中间计算（归一化序列、IC 值、权重解等）进行缓存，避免重复开销。
+    功能:
+      - 维护一个最多包含 `max_pool_size` 条归一化因子序列的因子池。
+      - 每当有新因子生成时，执行截尾（Winsorize）和 Z-score 标准化，并计算该因子的单因子 IC（Information Coefficient）。
+      - 将新因子加入因子池后，通过凸优化（SLSQP）求解最优线性权重，以最大化组合 IC。
+      - 若因子池超过上限，则剔除对组合贡献度最小的因子。
+      - 在多次计算中对标准化序列、IC 值、最优权重等中间结果进行缓存，以减少重复开销。
+
+    Attributes:
+        max_pool_size (int): 因子池最大容量。超过后将删除贡献最小的因子。
+        alphas (List[np.ndarray]): 原始因子序列列表。
+        norm_alphas (List[np.ndarray]): 归一化后的因子序列列表。
+        ic_list (List[float]): 对应每条因子的单因子 IC 列表。
+        weights (List[float]): 当前组合中各因子的线性权重。
+        expr_list (List[str]): 保存每条因子对应的 RPN 表达式。
+        _cache (Dict): 缓存用于存储中间计算结果。
+        data (pd.DataFrame): 注入的行情数据。
+        _target (np.ndarray): 注入的目标列（未来收益）数组。
     """
     def __init__(self, max_pool_size: int = 50):
         """
-        初始化因子组合模型。
+        初始化 AlphaCombinationModel。
 
-        参数：
-        - max_pool_size：因子池最大容量，超过后会剔除贡献度最低的因子。
+        Args:
+            max_pool_size (int): 因子池的最大容量，上限内优先保留贡献度高的因子。
         """
         self.max_pool_size = max_pool_size
         self.alphas = []         # 原始因子序列列表
@@ -33,27 +44,33 @@ class AlphaCombinationModel:
         self._cache = {}         # 缓存字典，用于存储中间结果
         self.expr_list = []      # 新增：对应每条因子的 RPN 表达式字符串
 
-    def inject_data(self, df: pd.DataFrame, target_col) -> None:
+    def inject_data(self, df: pd.DataFrame, target_col: str) -> None:
         """
-        在主程序中加载好行情后，把 df 注入模型，
-        target_col 是未来收益列，用于计算 IC。
+        注入市场行情数据和目标序列，用于 IC 计算与权重优化。
+
+        Args:
+            df (pd.DataFrame): 行情特征表，包含基础字段和目标列。
+            target_col (str): DataFrame 中代表未来收益的列名，用于 IC 计算。
+
+        Raises:
+            ValueError: 当 target_col 不在 df 列时抛出。
         """
+        # TODO: 需要更细致的训练集 / 验证集 分割逻辑，添加新的数据集作为验证集 etc
         self.data: pd.DataFrame = df
         self._target = df[target_col].values.astype(np.float64)
 
+
     def update_with(self, new_alpha: np.ndarray, expr: str):
         """
-        添加并更新新因子至因子池，同时保存其表达式。
+        将新因子加入池中并更新组合：
+          1. 对原始因子序列做 winsorize 和 z-score 标准化。
+          2. 计算并缓存该因子的 IC。
+          3. 添加至因子池后，重优化线性权重。
+          4. 超出容量时剔除贡献最小的因子。
 
-        步骤：
-        1. 对 new_alpha 做 winsorize 截尾与 z-score 归一化。
-        2. 计算该因子的单因子 IC，并缓存结果。
-        3. 将归一化因子与其 IC 加入池中，重新求解最优权重。
-        4. 若因子池超限，剔除 |w·IC| 最小的那个因子。
-
-        参数：
-        - new_alpha：原始因子值数组（numpy）。
-        - expr     ：该因子对应的 RPN 表达式字符串。
+        Args:
+            new_alpha (np.ndarray): 新因子的原始序列数据，长度与注入的行情一致。
+            expr (str): 生成该因子的 RPN 表达式字符串，用于记录及缓存键。
         """
         # 归一化
         norm = winsorize(zscore_normalize(new_alpha))
@@ -86,22 +103,27 @@ class AlphaCombinationModel:
 
     def add_alpha_expr(self, expr: str) -> float:
         """
-        根据表达式计算因子、IC，并把它加入因子池。
-        返回该因子的单因子 IC，方便上层当作 reward 使用。
+        根据 RPN 表达式计算新因子，并将其加入因子池。
+
+        Args:
+            expr (str): RPN 格式的表达式，例如 "close 5 ts_mean"。
+
+        Returns:
+            float: 该因子的单 IC 值，可作为强化学习的 reward。
+
+        Raises:
+            ValueError: 当表达式格式错误或运算失败时。
         """
         new_alpha = self._compute_alpha_from_expr(expr)
-        ic = self.evaluate_alpha(expr)            # 里面自带缓存
+        ic = self.evaluate_alpha(expr)                  # 里面自带缓存
         self.update_with(new_alpha, expr)
         return ic
 
     def _reoptimize_weights(self):
         """
-        求解最优线性权重，使组合 IC 最大。
-
-        实现细节：
-        - 目标：最小化负的组合 IC。
-        - 约束：权重绝对值之和等于 1（L1 归一化）。
-        - 求解器：使用 scipy.optimize.minimize，默认 SLSQP 方法。
+        使用凸优化（SLSQP）在当前因子池上求解最优线性权重，
+        目标：最大化组合序列与目标的 Pearson 相关系数（IC），
+        约束：权重绝对值之和等于 1（L1 归一化）。
         """
         A = np.vstack(self.norm_alphas).T
         target = self._load_validation_target()
@@ -119,14 +141,16 @@ class AlphaCombinationModel:
 
     def evaluate_alpha(self, expr: str) -> float:
         """
-        根据给定的表达式（RPN 格式）计算原始因子序列，
-        然后做归一化并返回其单因子 IC（带缓存）。
+        直接根据 RPN 表达式计算并返回单因子 IC（带缓存）。
 
-        参数：
-        - expr：因子表达式（逆波兰表示法字符串）。
+        Args:
+            expr (str): RPN 表达式字符串。
 
-        返回：
-        - 该表达式对应因子的 IC 值。
+        Returns:
+            float: 该表达式生成因子的 Pearson IC。
+
+        Raises:
+            ValueError: 当表达式解析或运算失败时。
         """
         new_alpha = self._compute_alpha_from_expr(expr)
         norm = self._maybe_normalize(new_alpha)
@@ -138,10 +162,10 @@ class AlphaCombinationModel:
 
     def score(self) -> float:
         """
-        计算并返回当前加权组合在验证集上的信息系数（IC）。
+        计算当前因子组合在验证集上的加权 IC。
 
-        返回：
-        - 组合因子的 IC。
+        Returns:
+            float: 组合因子的 Pearson IC 值。
         """
         A = np.vstack(self.norm_alphas).T
         combo = A.dot(np.array(self.weights))
@@ -150,8 +174,13 @@ class AlphaCombinationModel:
 
     def _load_validation_target(self) -> np.ndarray:
         """
-        加载验证集的目标序列（如未来收益或方向标签）。
-        该方法需由用户实现以接入实际数据。
+        获取注入的目标序列数组（未来收益或方向）。
+
+        Returns:
+            np.ndarray: 目标序列数值数组。
+
+        Raises:
+            AttributeError: 若未调用 `inject_data` 注入数据时。
         """
         if not hasattr(self, "_target"):
             raise AttributeError("请先调用 inject_data() 注入行情和目标序列")
@@ -159,17 +188,17 @@ class AlphaCombinationModel:
 
     def _compute_alpha_from_expr(self, expr: str) -> np.ndarray:
         """
-        解析 RPN 表达式并返回对应的 numpy.ndarray 因子序列。
+        解析逆波兰表达式（RPN），执行算子运算，生成原始因子序列。
 
-        设计约定
-        ----------
-        • 基础变量：直接写列名，例如 'close'、'volume'；必须存在于 self.data 中  
-        • 常量      ：写成数字字符串，如 '5'、'0.3'，自动转 float  
-        • 一元/二元/多元算子：对应 operators.py 中的函数名，例如
-              "close 5 ts_mean"    # → ts_mean(close, 5)
-              "high low - ts_max"  # → ts_max(high - low)
-              "open close ts_corr 20" # → ts_corr(open, close, 20)
-        • 每个函数的“参数个数” (= arity) 通过反射自动推断，兼容新算子零改动
+        Args:
+            expr (str): 形如 "close 5 ts_mean" 的 RPN 表达式字符串。
+
+        Returns:
+            np.ndarray: 计算得到的因子值数组，dtype=float64。
+
+        Raises:
+            AttributeError: 若未注入 `data` 时调用。
+            ValueError: 表达式格式错误（未知 token、参数不足或最终栈深 != 1）。
         """
         if not hasattr(self, "data"):
             raise AttributeError(
@@ -191,7 +220,11 @@ class AlphaCombinationModel:
                 stack.append(self.data[tk])
             # -- 2. 数值常量 ----------------------------------------------------
             elif _is_float(tk):
-                stack.append(float(tk))
+                val = float(tk)
+                if val.is_integer():
+                    stack.append(int(val))
+                else:
+                    stack.append(float(tk))
             # -- 3. 函数 / 运算符 ----------------------------------------------
             elif tk in func_map:
                 fn, arity = func_map[tk]
@@ -222,17 +255,27 @@ class AlphaCombinationModel:
     
     def _maybe_normalize(self, alpha: np.ndarray) -> np.ndarray:
         """
-        对原始因子序列执行 winsorize 截尾和 z-score 归一化。
+        对原始因子序列执行截尾（winsorize）和 Z-score 标准化。
+
+        Args:
+            alpha (np.ndarray): 原始因子值数组。
+
+        Returns:
+            np.ndarray: 归一化后的因子序列。
         """
         return winsorize(zscore_normalize(alpha))
 
         # === 1. RPN 解析与执行 ====================================================
 
-
 def _is_float(str) -> bool:
     """
-    判断字符串 s 是否能被转换成 float。
-    返回 True 表示可以, False 表示不行。
+    判断字符串是否可转换为浮点数。
+
+    Args:
+        s (str): 待检测字符串。
+
+    Returns:
+        bool: 若能安全转换为 float，则返回 True，否则 False。
     """
     try:
         float(str)

@@ -1,282 +1,5 @@
 ================================================================================
-File: .\combination.py
---------------------------------------------------------------------------------
-# combination.py
-import numpy as np
-from utility import zscore_normalize, winsorize, information_coefficient
-from scipy.optimize import minimize
-from typing import List, Dict, Union, Tuple, Callable
-import operators
-import pandas as pd
-import inspect
-
-class AlphaCombinationModel:
-    """
-    因子线性组合管理器，实现论文中算法1的核心思想。
-
-    功能：
-    1. 维护一个最多包含 max_pool_size 条归一化因子序列的因子池。
-    2. 每当有新因子生成时，对其进行截尾与 Z-score 归一化，并计算信息系数（IC）。
-    3. 将新因子加入因子池后，使用凸优化求解最优线性权重，以最大化组合 IC。
-    4. 如果因子池大小超出上限，则剔除对组合贡献最小的因子。
-    5. 对中间计算（归一化序列、IC 值、权重解等）进行缓存，避免重复开销。
-    """
-    def __init__(self, max_pool_size: int = 50):
-        """
-        初始化因子组合模型。
-
-        参数：
-        - max_pool_size：因子池最大容量，超过后会剔除贡献度最低的因子。
-        """
-        self.max_pool_size = max_pool_size
-        self.alphas = []         # 原始因子序列列表
-        self.norm_alphas = []    # 归一化后的因子序列列表
-        self.ic_list = []        # 对应的单因子 IC 值列表
-        self.weights = []        # 当前组合的线性权重列表
-        self._cache = {}         # 缓存字典，用于存储中间结果
-        self.expr_list = []      # 新增：对应每条因子的 RPN 表达式字符串
-
-    def inject_data(self, df: pd.DataFrame, target_col) -> None:
-        """
-        在主程序中加载好行情后，把 df 注入模型，
-        target_col 是未来收益列，用于计算 IC。
-        """
-        self.data: pd.DataFrame = df
-        self._target = df[target_col].values.astype(np.float64)
-
-    def update_with(self, new_alpha: np.ndarray, expr: str):
-        """
-        添加并更新新因子至因子池，同时保存其表达式。
-
-        步骤：
-        1. 对 new_alpha 做 winsorize 截尾与 z-score 归一化。
-        2. 计算该因子的单因子 IC，并缓存结果。
-        3. 将归一化因子与其 IC 加入池中，重新求解最优权重。
-        4. 若因子池超限，剔除 |w·IC| 最小的那个因子。
-
-        参数：
-        - new_alpha：原始因子值数组（numpy）。
-        - expr     ：该因子对应的 RPN 表达式字符串。
-        """
-        # 归一化
-        norm = winsorize(zscore_normalize(new_alpha))
-        key = ('ic', tuple(norm))
-        if key in self._cache:
-            ic = self._cache[key]
-        else:
-            target = self._load_validation_target()
-            ic = information_coefficient(norm, target)
-            self._cache[key] = ic
-
-        # 更新因子池
-        self.alphas.append(new_alpha)
-        self.norm_alphas.append(norm)
-        self.ic_list.append(ic)
-        self.expr_list.append(expr)          # 记录表达式
-
-        # 若是首因子直接赋权 1；否则重优化权重
-        if len(self.norm_alphas) == 1:
-            self.weights = [1.0]
-        else:
-            self._reoptimize_weights()
-
-        # 超限时剔除贡献最小因子
-        if len(self.alphas) > self.max_pool_size:
-            contrib = [abs(w * ic) for w, ic in zip(self.weights, self.ic_list)]
-            idx = contrib.index(min(contrib))
-            for lst in (self.alphas, self.norm_alphas, self.ic_list, self.weights):
-                lst.pop(idx)
-
-    def add_alpha_expr(self, expr: str) -> float:
-        """
-        根据表达式计算因子、IC，并把它加入因子池。
-        返回该因子的单因子 IC，方便上层当作 reward 使用。
-        """
-        new_alpha = self._compute_alpha_from_expr(expr)
-        ic = self.evaluate_alpha(expr)            # 里面自带缓存
-        self.update_with(new_alpha, expr)
-        return ic
-
-    def _reoptimize_weights(self):
-        """
-        求解最优线性权重，使组合 IC 最大。
-
-        实现细节：
-        - 目标：最小化负的组合 IC。
-        - 约束：权重绝对值之和等于 1（L1 归一化）。
-        - 求解器：使用 scipy.optimize.minimize，默认 SLSQP 方法。
-        """
-        A = np.vstack(self.norm_alphas).T
-        target = self._load_validation_target()
-
-        def objective(w):
-            combo = A.dot(w)
-            ic = np.corrcoef(combo, target)[0, 1]
-            return -np.nan_to_num(ic)
-
-        cons = ({'type': 'eq', 'fun': lambda w: np.sum(np.abs(w)) - 1})
-        x0 = np.ones(A.shape[1]) / A.shape[1]
-        res = minimize(objective, x0, constraints=cons, method='SLSQP')
-        self.weights = res.x.tolist()
-        self._cache['weights'] = res.x.copy()
-
-    def evaluate_alpha(self, expr: str) -> float:
-        """
-        根据给定的表达式（RPN 格式）计算原始因子序列，
-        然后做归一化并返回其单因子 IC（带缓存）。
-
-        参数：
-        - expr：因子表达式（逆波兰表示法字符串）。
-
-        返回：
-        - 该表达式对应因子的 IC 值。
-        """
-        new_alpha = self._compute_alpha_from_expr(expr)
-        norm = self._maybe_normalize(new_alpha)
-        key = ('expr_ic', expr)
-        if key not in self._cache:
-            target = self._load_validation_target()
-            self._cache[key] = information_coefficient(norm, target)
-        return self._cache[key]
-
-    def score(self) -> float:
-        """
-        计算并返回当前加权组合在验证集上的信息系数（IC）。
-
-        返回：
-        - 组合因子的 IC。
-        """
-        A = np.vstack(self.norm_alphas).T
-        combo = A.dot(np.array(self.weights))
-        target = self._load_validation_target()
-        return information_coefficient(combo, target)
-
-    def _load_validation_target(self) -> np.ndarray:
-        """
-        加载验证集的目标序列（如未来收益或方向标签）。
-        该方法需由用户实现以接入实际数据。
-        """
-        if not hasattr(self, "_target"):
-            raise AttributeError("请先调用 inject_data() 注入行情和目标序列")
-        return self._target
-
-    def _compute_alpha_from_expr(self, expr: str) -> np.ndarray:
-        """
-        解析 RPN 表达式并返回对应的 numpy.ndarray 因子序列。
-
-        设计约定
-        ----------
-        • 基础变量：直接写列名，例如 'close'、'volume'；必须存在于 self.data 中  
-        • 常量      ：写成数字字符串，如 '5'、'0.3'，自动转 float  
-        • 一元/二元/多元算子：对应 operators.py 中的函数名，例如
-              "close 5 ts_mean"    # → ts_mean(close, 5)
-              "high low - ts_max"  # → ts_max(high - low)
-              "open close ts_corr 20" # → ts_corr(open, close, 20)
-        • 每个函数的“参数个数” (= arity) 通过反射自动推断，兼容新算子零改动
-        """
-        if not hasattr(self, "data"):
-            raise AttributeError(
-                "AlphaCombinationModel 需先注入行情 DataFrame 到 self.data"
-            )
-
-        tokens: List[str] = expr.strip().split()
-        stack: List[Union[pd.Series, float]] = []
-
-        # 预构建 “函数名 → (Callable, arity)” 映射
-        func_map: Dict[str, Tuple[Callable, int]] = {}
-        for name, fn in inspect.getmembers(operators, inspect.isfunction):
-            sig = inspect.signature(fn)
-            func_map[name] = (fn, len(sig.parameters))
-
-        for tk in tokens:
-            # -- 1. 基础变量 ----------------------------------------------------
-            if tk in self.data.columns:
-                stack.append(self.data[tk])
-            # -- 2. 数值常量 ----------------------------------------------------
-            elif _is_float(tk):
-                stack.append(float(tk))
-            # -- 3. 函数 / 运算符 ----------------------------------------------
-            elif tk in func_map:
-                fn, arity = func_map[tk]
-                if len(stack) < arity:
-                    raise ValueError(f"RPN 表达式参数不足：{tk}")
-                # 注意：弹栈顺序需反转以保持原来顺序
-                args = [stack.pop() for _ in range(arity)][::-1]
-                res = fn(*args)
-                stack.append(res)
-            # -- 4. 支持最常见的四则运算符 -------------------------------------
-            elif tk in {"+", "-", "*", "/"}:
-                if len(stack) < 2:
-                    raise ValueError(f"RPN 表达式参数不足：{tk}")
-                b, a = stack.pop(), stack.pop()
-                if tk == "+": res = a + b
-                elif tk == "-": res = a - b
-                elif tk == "*": res = a * b
-                elif tk == "/": res = a / (b.replace(0, np.nan) if isinstance(b, pd.Series) else (b if b != 0 else np.nan))
-                stack.append(res)
-            else:
-                raise ValueError(f"未知 token：{tk}")
-
-        if len(stack) != 1:
-            raise ValueError("RPN 表达式最终栈深度应为 1")
-        # 返回 numpy 数组，后续会做 winsorize + z-score
-        series = stack[0]
-        return np.asarray(series.values, dtype=np.float64)
-    
-    def _maybe_normalize(self, alpha: np.ndarray) -> np.ndarray:
-        """
-        对原始因子序列执行 winsorize 截尾和 z-score 归一化。
-        """
-        return winsorize(zscore_normalize(alpha))
-
-        # === 1. RPN 解析与执行 ====================================================
-
-
-def _is_float(str) -> bool:
-    """
-    判断字符串 s 是否能被转换成 float。
-    返回 True 表示可以, False 表示不行。
-    """
-    try:
-        float(str)
-        return True
-    except ValueError:
-        return False
-
-================================================================================
-File: .\data.py
---------------------------------------------------------------------------------
-# data.py 
-
-import pandas as pd
-
-
-def load_market_data(path: str = "data/rb_20250606_primary.csv", n: int = 5):
-    """
-    读取并预处理原始 A 股行情数据。
-
-    参数
-    ----------
-    path : str, 可选
-        CSV 文件的本地路径，默认为 ``"data/rb_20250606_primary.csv"``。
-    n: int 可选
-        预测 n 秒之后的收益率
-
-    返回
-    ----------
-    pandas.DataFrame
-        处理后的行情特征表，包含基础字段以及 ``target``（20 日远期收益）列。
-    """
-    # TODO: 这里暂时读取本地文件
-
-    df = pd.read_csv(path, parse_dates=["timestamp"], index_col="timestamp")
-    df = df["close"].resample("1s").ohlc()
-    df["target"] = df["close"].pct_change(periods=-n)
-    return df
-
-
-================================================================================
-File: .\envs.py
+File: ./envs.py
 --------------------------------------------------------------------------------
 # env.py
 from combination import AlphaCombinationModel
@@ -350,7 +73,7 @@ class AlphaGenerationEnv:
         self.sequence.append(action)
         token = self.tokenizer.decode([action])
         reward = 0.0
-        if token == self.tokenizer.sep_token or len(self.sequence) >= self.max_len:
+        if action == self.tokenizer.sep_token_id or len(self.sequence) >= self.max_len:
             expr = self.tokenizer.decode(self.sequence[1:-1])
             reward = self.combo_model.evaluate_alpha(expr)
             self.done = True
@@ -408,6 +131,7 @@ class AlphaGenerationEnv:
                 return 0
             return 1  # 操作数
 
+        stack_depth = 0
         for tk in tokens:
             stack_depth += _delta(tk)
 
@@ -449,7 +173,545 @@ class AlphaGenerationEnv:
 
 
 ================================================================================
-File: .\generator.py
+File: ./utility.py
+--------------------------------------------------------------------------------
+# utility.py
+
+import numpy as np
+import pandas as pd
+
+def zscore_normalize(alpha: np.ndarray) -> pd.Series:
+    """
+    Z-score 标准化处理：消除因子的尺度影响
+    """
+    a = np.asarray(alpha, dtype=np.float64)
+    # 用 nanmean/nanstd 自动跳过 NaN
+    mean = np.nanmean(a)
+    std = np.nanstd(a)
+    # 如果全是 NaN 或者方差为 0
+    if std == 0 or np.isnan(std):
+        return pd.Series(np.zeros_like(a))
+    return pd.Series((a - mean) / std)
+
+def winsorize(alpha: np.ndarray, lower_quantile: float = 0.01, upper_quantile: float = 0.99) -> pd.Series:
+    """
+    异常值截断处理：防止 outlier 扰动因子稳定性
+    """
+    a = np.asarray(alpha, dtype=float)
+    lower = np.nanpercentile(a, lower_quantile * 100)
+    upper = np.nanpercentile(a, upper_quantile * 100)
+    clipped = np.clip(a, lower, upper)
+    return pd.Series(clipped)
+
+def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
+    """
+    信息系数（IC）：衡量因子预测未来收益的能力，Pearson 相关系数
+    """
+    if len(factor) != len(target):
+        raise ValueError("Factor and target length mismatch")
+    
+    # 1. 同时有效（非 NaN/Inf）的掩码
+    mask = np.isfinite(factor) & np.isfinite(target)
+    if mask.sum() < 2:               # 样本太少无法算相关
+        return 0.0
+    
+    f, t = factor[mask], target[mask]
+
+    # 2. σ=0 说明缺乏波动，相关性定义无意义，直接返回 0
+    if np.std(f) == 0 or np.std(t) == 0:
+        return 0.0
+
+    return float(np.corrcoef(f, t)[0, 1])
+
+================================================================================
+File: ./__init__.py
+--------------------------------------------------------------------------------
+
+
+================================================================================
+File: ./combination.py
+--------------------------------------------------------------------------------
+# combination.py
+import numpy as np
+from utility import zscore_normalize, winsorize, information_coefficient
+from scipy.optimize import minimize
+from typing import List, Dict, Union, Tuple, Callable
+import operators
+import pandas as pd
+import inspect
+
+class AlphaCombinationModel:
+    """
+    因子线性组合管理器，实现论文中算法1的核心思想。
+
+    功能:
+      - 维护一个最多包含 `max_pool_size` 条归一化因子序列的因子池。
+      - 每当有新因子生成时，执行截尾（Winsorize）和 Z-score 标准化，并计算该因子的单因子 IC（Information Coefficient）。
+      - 将新因子加入因子池后，通过凸优化（SLSQP）求解最优线性权重，以最大化组合 IC。
+      - 若因子池超过上限，则剔除对组合贡献度最小的因子。
+      - 在多次计算中对标准化序列、IC 值、最优权重等中间结果进行缓存，以减少重复开销。
+
+    Attributes:
+        max_pool_size (int): 因子池最大容量。超过后将删除贡献最小的因子。
+        alphas (List[np.ndarray]): 原始因子序列列表。
+        norm_alphas (List[np.ndarray]): 归一化后的因子序列列表。
+        ic_list (List[float]): 对应每条因子的单因子 IC 列表。
+        weights (List[float]): 当前组合中各因子的线性权重。
+        expr_list (List[str]): 保存每条因子对应的 RPN 表达式。
+        _cache (Dict): 缓存用于存储中间计算结果。
+        data (pd.DataFrame): 注入的行情数据。
+        _target (np.ndarray): 注入的目标列（未来收益）数组。
+    """
+    def __init__(self, max_pool_size: int = 50):
+        """
+        初始化 AlphaCombinationModel。
+
+        Args:
+            max_pool_size (int): 因子池的最大容量，上限内优先保留贡献度高的因子。
+        """
+        self.max_pool_size = max_pool_size
+        self.alphas = []         # 原始因子序列列表
+        self.norm_alphas = []    # 归一化后的因子序列列表
+        self.ic_list = []        # 对应的单因子 IC 值列表
+        self.weights = []        # 当前组合的线性权重列表
+        self._cache = {}         # 缓存字典，用于存储中间结果
+        self.expr_list = []      # 新增：对应每条因子的 RPN 表达式字符串
+
+    def inject_data(self, df: pd.DataFrame, target_col: str) -> None:
+        """
+        注入市场行情数据和目标序列，用于 IC 计算与权重优化。
+
+        Args:
+            df (pd.DataFrame): 行情特征表，包含基础字段和目标列。
+            target_col (str): DataFrame 中代表未来收益的列名，用于 IC 计算。
+
+        Raises:
+            ValueError: 当 target_col 不在 df 列时抛出。
+        """
+        # TODO: 需要更细致的训练集 / 验证集 分割逻辑，添加新的数据集作为验证集 etc
+        self.data: pd.DataFrame = df
+        self._target = df[target_col].values.astype(np.float64)
+
+
+    def update_with(self, new_alpha: np.ndarray, expr: str):
+        """
+        将新因子加入池中并更新组合：
+          1. 对原始因子序列做 winsorize 和 z-score 标准化。
+          2. 计算并缓存该因子的 IC。
+          3. 添加至因子池后，重优化线性权重。
+          4. 超出容量时剔除贡献最小的因子。
+
+        Args:
+            new_alpha (np.ndarray): 新因子的原始序列数据，长度与注入的行情一致。
+            expr (str): 生成该因子的 RPN 表达式字符串，用于记录及缓存键。
+        """
+        # 归一化
+        norm = winsorize(zscore_normalize(new_alpha))
+        key = ('ic', tuple(norm))
+        if key in self._cache:
+            ic = self._cache[key]
+        else:
+            target = self._load_validation_target()
+            ic = information_coefficient(norm, target)
+            self._cache[key] = ic
+
+        # 更新因子池
+        self.alphas.append(new_alpha)
+        self.norm_alphas.append(norm)
+        self.ic_list.append(ic)
+        self.expr_list.append(expr)          # 记录表达式
+
+        # 若是首因子直接赋权 1；否则重优化权重
+        if len(self.norm_alphas) == 1:
+            self.weights = [1.0]
+        else:
+            self._reoptimize_weights()
+
+        # 超限时剔除贡献最小因子
+        if len(self.alphas) > self.max_pool_size:
+            contrib = [abs(w * ic) for w, ic in zip(self.weights, self.ic_list)]
+            idx = contrib.index(min(contrib))
+            for lst in (self.alphas, self.norm_alphas, self.ic_list, self.weights):
+                lst.pop(idx)
+
+    def add_alpha_expr(self, expr: str) -> float:
+        """
+        根据 RPN 表达式计算新因子，并将其加入因子池。
+
+        Args:
+            expr (str): RPN 格式的表达式，例如 "close 5 ts_mean"。
+
+        Returns:
+            float: 该因子的单 IC 值，可作为强化学习的 reward。
+
+        Raises:
+            ValueError: 当表达式格式错误或运算失败时。
+        """
+        new_alpha = self._compute_alpha_from_expr(expr)
+        ic = self.evaluate_alpha(expr)                  # 里面自带缓存
+        self.update_with(new_alpha, expr)
+        return ic
+
+    def _reoptimize_weights(self):
+        """
+        使用凸优化（SLSQP）在当前因子池上求解最优线性权重，
+        目标：最大化组合序列与目标的 Pearson 相关系数（IC），
+        约束：权重绝对值之和等于 1（L1 归一化）。
+        """
+        A = np.vstack(self.norm_alphas).T
+        target = self._load_validation_target()
+
+        def objective(w):
+            combo = A.dot(w)
+            ic = np.corrcoef(combo, target)[0, 1]
+            return -np.nan_to_num(ic)
+
+        cons = ({'type': 'eq', 'fun': lambda w: np.sum(np.abs(w)) - 1})
+        x0 = np.ones(A.shape[1]) / A.shape[1]
+        res = minimize(objective, x0, constraints=cons, method='SLSQP')
+        self.weights = res.x.tolist()
+        self._cache['weights'] = res.x.copy()
+
+    def evaluate_alpha(self, expr: str) -> float:
+        """
+        直接根据 RPN 表达式计算并返回单因子 IC（带缓存）。
+
+        Args:
+            expr (str): RPN 表达式字符串。
+
+        Returns:
+            float: 该表达式生成因子的 Pearson IC。
+
+        Raises:
+            ValueError: 当表达式解析或运算失败时。
+        """
+        new_alpha = self._compute_alpha_from_expr(expr)
+        norm = self._maybe_normalize(new_alpha)
+        key = ('expr_ic', expr)
+        if key not in self._cache:
+            target = self._load_validation_target()
+            self._cache[key] = information_coefficient(norm, target)
+        return self._cache[key]
+
+    def score(self) -> float:
+        """
+        计算当前因子组合在验证集上的加权 IC。
+
+        Returns:
+            float: 组合因子的 Pearson IC 值。
+        """
+        A = np.vstack(self.norm_alphas).T
+        combo = A.dot(np.array(self.weights))
+        target = self._load_validation_target()
+        return information_coefficient(combo, target)
+
+    def _load_validation_target(self) -> np.ndarray:
+        """
+        获取注入的目标序列数组（未来收益或方向）。
+
+        Returns:
+            np.ndarray: 目标序列数值数组。
+
+        Raises:
+            AttributeError: 若未调用 `inject_data` 注入数据时。
+        """
+        if not hasattr(self, "_target"):
+            raise AttributeError("请先调用 inject_data() 注入行情和目标序列")
+        return self._target
+
+    def _compute_alpha_from_expr(self, expr: str) -> np.ndarray:
+        """
+        解析逆波兰表达式（RPN），执行算子运算，生成原始因子序列。
+
+        Args:
+            expr (str): 形如 "close 5 ts_mean" 的 RPN 表达式字符串。
+
+        Returns:
+            np.ndarray: 计算得到的因子值数组，dtype=float64。
+
+        Raises:
+            AttributeError: 若未注入 `data` 时调用。
+            ValueError: 表达式格式错误（未知 token、参数不足或最终栈深 != 1）。
+        """
+        if not hasattr(self, "data"):
+            raise AttributeError(
+                "AlphaCombinationModel 需先注入行情 DataFrame 到 self.data"
+            )
+
+        tokens: List[str] = expr.strip().split()
+        stack: List[Union[pd.Series, float]] = []
+
+        # 预构建 “函数名 → (Callable, arity)” 映射
+        func_map: Dict[str, Tuple[Callable, int]] = {}
+        for name, fn in inspect.getmembers(operators, inspect.isfunction):
+            sig = inspect.signature(fn)
+            func_map[name] = (fn, len(sig.parameters))
+
+        for tk in tokens:
+            # -- 1. 基础变量 ----------------------------------------------------
+            if tk in self.data.columns:
+                stack.append(self.data[tk])
+            # -- 2. 数值常量 ----------------------------------------------------
+            elif _is_float(tk):
+                val = float(tk)
+                if val.is_integer():
+                    stack.append(int(val))
+                else:
+                    stack.append(float(tk))
+            # -- 3. 函数 / 运算符 ----------------------------------------------
+            elif tk in func_map:
+                fn, arity = func_map[tk]
+                if len(stack) < arity:
+                    raise ValueError(f"RPN 表达式参数不足：{tk}")
+                # 注意：弹栈顺序需反转以保持原来顺序
+                args = [stack.pop() for _ in range(arity)][::-1]
+                res = fn(*args)
+                stack.append(res)
+            # -- 4. 支持最常见的四则运算符 -------------------------------------
+            elif tk in {"+", "-", "*", "/"}:
+                if len(stack) < 2:
+                    raise ValueError(f"RPN 表达式参数不足：{tk}")
+                b, a = stack.pop(), stack.pop()
+                if tk == "+": res = a + b
+                elif tk == "-": res = a - b
+                elif tk == "*": res = a * b
+                elif tk == "/": res = a / (b.replace(0, np.nan) if isinstance(b, pd.Series) else (b if b != 0 else np.nan))
+                stack.append(res)
+            else:
+                raise ValueError(f"未知 token：{tk}")
+
+        if len(stack) != 1:
+            raise ValueError("RPN 表达式最终栈深度应为 1")
+        # 返回 numpy 数组，后续会做 winsorize + z-score
+        series = stack[0]
+        return np.asarray(series.values, dtype=np.float64)
+    
+    def _maybe_normalize(self, alpha: np.ndarray) -> np.ndarray:
+        """
+        对原始因子序列执行截尾（winsorize）和 Z-score 标准化。
+
+        Args:
+            alpha (np.ndarray): 原始因子值数组。
+
+        Returns:
+            np.ndarray: 归一化后的因子序列。
+        """
+        return winsorize(zscore_normalize(alpha))
+
+        # === 1. RPN 解析与执行 ====================================================
+
+def _is_float(str) -> bool:
+    """
+    判断字符串是否可转换为浮点数。
+
+    Args:
+        s (str): 待检测字符串。
+
+    Returns:
+        bool: 若能安全转换为 float，则返回 True，否则 False。
+    """
+    try:
+        float(str)
+        return True
+    except ValueError:
+        return False
+
+================================================================================
+File: ./tokenizer.py
+--------------------------------------------------------------------------------
+# tokenizer.py
+import re
+import inspect
+import operators
+from typing import List, Dict
+
+class AlphaTokenizer:
+    """
+    将逆波兰表达式 (RPN) 与 token 序列相互映射的分词器。
+
+    - **词表**：基础行情字段、常量桶、所有算子以及四则运算符  
+    - **特殊标记**：`[PAD]` 填充、`[BOS]` 序列起始、`[SEP]` 序列终止
+    """
+    def __init__(self, base_fields: List[str] = None, const_buckets: List[float] = None):
+        """
+        构造分词器并自动扫描 `operators.py` 生成完整词表。
+
+        参数
+        ----------
+        base_fields : list[str], 可选
+            基础行情字段名称列表，默认为  
+            ``['open', 'high', 'low', 'close', 'volume']``。
+        const_buckets : list[float], 可选
+            预定义浮点常量桶，默认为  
+            ``[1, 3, 5, 10, 20, 0.1, 0.5]``。
+        """
+        if base_fields is None:
+            base_fields = ['open', 'high', 'low', 'close', 'volume']
+        if const_buckets is None:
+            const_buckets = [1, 3, 5, 10, 20, 0.1, 0.5]
+
+        self.base_fields = base_fields
+        self.const_buckets = const_buckets
+
+        # 特殊 token
+        self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
+
+        # 基础字段 token
+        field_tokens = base_fields
+
+        # 常量 token
+        const_tokens = [f'CONST_{c}' for c in const_buckets]
+
+        # 算子 token：自动扫描 operators.py
+        op_tokens = []
+        for name, fn in inspect.getmembers(operators, inspect.isfunction):
+            if not name.startswith("_"):
+                op_tokens.append(name)
+
+        # 词表
+        arith = ['+', '-', '*', '/']
+        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens + arith
+
+        # ID ↔ Token 映射
+        self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
+        self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
+
+        # 便捷属性
+        self.pad_token_id = self.token_to_id['[PAD]']
+        self.bos_token_id = self.token_to_id['[BOS]']
+        self.sep_token_id = self.token_to_id['[SEP]']
+
+    @property
+    def vocab_size(self) -> int:
+        """
+        返回当前词表大小。
+
+        返回
+        ----------
+        int
+            ``len(self.vocab)``。
+        """
+        return len(self.vocab)
+
+    def encode(self, expr: str, add_special_tokens: bool = True) -> List[int]:
+        """
+        将 RPN 字符串编码为 token ID 序列。
+
+        参数
+        ----------
+        expr : str
+            形如 ``"close 5 ts_mean"`` 的逆波兰表达式。
+        add_special_tokens : bool, 可选
+            是否在首尾分别加入 `[BOS]` 与 `[SEP]`，默认为 ``True``。
+
+        返回
+        ----------
+        list[int]
+            token ID 序列。
+        """
+        tokens = expr.strip().split()
+        ids = []
+        for tk in tokens:
+            # 基础字段
+            if tk in self.token_to_id:
+                ids.append(self.token_to_id[tk])
+            # 常量：动态加入最近的 bucket
+            elif self._is_float(tk):
+                val = float(tk)
+                const_tok = self._map_to_const(val)
+                ids.append(self.token_to_id[const_tok])
+            else:
+                raise ValueError(f"未知 token：{tk}")
+
+        if add_special_tokens:
+            ids = [self.bos_token_id] + ids + [self.sep_token_id]
+        return ids
+
+    def decode(self, ids: List[int], remove_special_tokens: bool = True) -> str:
+        """
+        将 token ID 序列还原为 RPN 字符串。
+
+        参数
+        ----------
+        ids : list[int]
+            编码后的 token ID 列表。
+        remove_special_tokens : bool, 可选
+            是否去除 `[BOS]` / `[SEP]` / `[PAD]`，默认为 ``True``。
+
+        返回
+        ----------
+        str
+            逆波兰表达式，常量会被还原为原始数字字符串。
+        """
+        toks = []
+        for idx in ids:
+            if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
+                continue
+            toks.append(self.id_to_token.get(idx, 'UNK'))
+        # 常量还原
+        toks = [self._const_to_str(tk) for tk in toks]
+        return " ".join(toks)
+
+    def _map_to_const(self, val: float) -> str:
+        """
+        将任意浮点数映射到最近的常量桶，并返回其 token 名。
+
+        参数
+        ----------
+        val : float
+            原始浮点数。
+
+        返回
+        ----------
+        str
+            形如 ``"CONST_5"`` 的 token 名称。
+        """
+        closest = min(self.const_buckets, key=lambda x: abs(x - val))
+        return f'CONST_{closest}'
+
+    def _const_to_str(self, token: str) -> str:
+        """
+        将常量 token 名恢复为数字字符串。
+
+        参数
+        ----------
+        token : str
+            形如 ``"CONST_3"`` 的 token。
+
+        返回
+        ----------
+        str
+            ``"3"``；如果传入非常量 token，则原样返回。
+        """
+        if token.startswith('CONST_'):
+            return token.split('_', 1)[1]
+        return token
+
+    @staticmethod
+    def _is_float(s: str) -> bool:
+        """
+        判断字符串能否安全转换为 `float`。
+
+        参数
+        ----------
+        s : str
+            待检测字符串。
+
+        返回
+        ----------
+        bool
+            可转换返回 ``True``，否则 ``False``。
+        """
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
+
+
+================================================================================
+File: ./generator.py
 --------------------------------------------------------------------------------
 from typing import List, Tuple, Dict, Any
 import torch
@@ -730,7 +992,45 @@ class RLAlphaGenerator:
     
 
 ================================================================================
-File: .\operators.py
+File: ./paradigm.py
+--------------------------------------------------------------------------------
+import numpy as np
+
+# alpha_mining_framework/
+# ├── __init__.py
+# ├── data.py            # Data loading & preprocessing
+# ├── utils.py           # Metrics: IC, RankIC, normalization, caching
+# ├── combination.py     # AlphaCombinationModel: linear combine + weight optimization
+# ├── env.py             # AlphaGenerationEnv: custom RL environment without gym
+# ├── generator.py       # RLAlphaGenerator: PPO policy & value networks
+# ├── train.py           # Main training loop implementing Algorithm 2
+# └── run_backtest.py    # Backtesting & investment simulation (Figure 5)
+
+
+
+
+
+
+================================================================================
+File: ./train.py
+--------------------------------------------------------------------------------
+# train.py
+from combination import AlphaCombinationModel
+from envs import AlphaGenerationEnv
+from generator import RLAlphaGenerator
+
+if __name__ == "__main__":
+    # 1. Load data
+    # 2. Initialize AlphaCombinationModel
+    # 3. Initialize tokenizer 和 AlphaGenerationEnv
+    # 4. Initialize RLAlphaGenerator
+    # 5. 调用 generator.train()
+    # 6. 保存发现的 alphas 和权重
+    pass
+
+
+================================================================================
+File: ./operators.py
 --------------------------------------------------------------------------------
 import pandas as pd
 import numpy as np
@@ -830,277 +1130,62 @@ def ts_return(series: pd.Series, period: int = 1) -> pd.Series:
 
 
 ================================================================================
-File: .\paradigm.py
+File: ./data.py
 --------------------------------------------------------------------------------
-import numpy as np
+# data.py 
 
-# alpha_mining_framework/
-# ├── __init__.py
-# ├── data.py            # Data loading & preprocessing
-# ├── utils.py           # Metrics: IC, RankIC, normalization, caching
-# ├── combination.py     # AlphaCombinationModel: linear combine + weight optimization
-# ├── env.py             # AlphaGenerationEnv: custom RL environment without gym
-# ├── generator.py       # RLAlphaGenerator: PPO policy & value networks
-# ├── train.py           # Main training loop implementing Algorithm 2
-# └── run_backtest.py    # Backtesting & investment simulation (Figure 5)
-
-
-
-
-
-
-================================================================================
-File: .\tokenizer.py
---------------------------------------------------------------------------------
-# tokenizer.py
-import re
-import inspect
-import operators
-from typing import List, Dict
-
-class AlphaTokenizer:
-    """
-    将逆波兰表达式 (RPN) 与 token 序列相互映射的分词器。
-
-    - **词表**：基础行情字段、常量桶、所有算子以及四则运算符  
-    - **特殊标记**：`[PAD]` 填充、`[BOS]` 序列起始、`[SEP]` 序列终止
-    """
-    def __init__(self, base_fields: List[str] = None, const_buckets: List[float] = None):
-        """
-        构造分词器并自动扫描 `operators.py` 生成完整词表。
-
-        参数
-        ----------
-        base_fields : list[str], 可选
-            基础行情字段名称列表，默认为  
-            ``['open', 'high', 'low', 'close', 'volume']``。
-        const_buckets : list[float], 可选
-            预定义浮点常量桶，默认为  
-            ``[1, 3, 5, 10, 20, 0.1, 0.5]``。
-        """
-        if base_fields is None:
-            base_fields = ['open', 'high', 'low', 'close', 'volume']
-        if const_buckets is None:
-            const_buckets = [1, 3, 5, 10, 20, 0.1, 0.5]
-
-        self.base_fields = base_fields
-        self.const_buckets = const_buckets
-
-        # 特殊 token
-        self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
-
-        # 基础字段 token
-        field_tokens = base_fields
-
-        # 常量 token
-        const_tokens = [f'CONST_{c}' for c in const_buckets]
-
-        # 算子 token：自动扫描 operators.py
-        op_tokens = []
-        for name, fn in inspect.getmembers(operators, inspect.isfunction):
-            if not name.startswith("_"):
-                op_tokens.append(name)
-
-        # 词表
-        arith = ['+', '-', '*', '/']
-        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens + arith
-
-        # ID ↔ Token 映射
-        self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
-        self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
-
-        # 便捷属性
-        self.pad_token_id = self.token_to_id['[PAD]']
-        self.bos_token_id = self.token_to_id['[BOS]']
-        self.sep_token_id = self.token_to_id['[SEP]']
-
-    @property
-    def vocab_size(self) -> int:
-        """
-        返回当前词表大小。
-
-        返回
-        ----------
-        int
-            ``len(self.vocab)``。
-        """
-        return len(self.vocab)
-
-    def encode(self, expr: str, add_special_tokens: bool = True) -> List[int]:
-        """
-        将 RPN 字符串编码为 token ID 序列。
-
-        参数
-        ----------
-        expr : str
-            形如 ``"close 5 ts_mean"`` 的逆波兰表达式。
-        add_special_tokens : bool, 可选
-            是否在首尾分别加入 `[BOS]` 与 `[SEP]`，默认为 ``True``。
-
-        返回
-        ----------
-        list[int]
-            token ID 序列。
-        """
-        tokens = expr.strip().split()
-        ids = []
-        for tk in tokens:
-            # 基础字段
-            if tk in self.token_to_id:
-                ids.append(self.token_to_id[tk])
-            # 常量：动态加入最近的 bucket
-            elif self._is_float(tk):
-                val = float(tk)
-                const_tok = self._map_to_const(val)
-                ids.append(self.token_to_id[const_tok])
-            else:
-                raise ValueError(f"未知 token：{tk}")
-
-        if add_special_tokens:
-            ids = [self.bos_token_id] + ids + [self.sep_token_id]
-        return ids
-
-    def decode(self, ids: List[int], remove_special_tokens: bool = True) -> str:
-        """
-        将 token ID 序列还原为 RPN 字符串。
-
-        参数
-        ----------
-        ids : list[int]
-            编码后的 token ID 列表。
-        remove_special_tokens : bool, 可选
-            是否去除 `[BOS]` / `[SEP]` / `[PAD]`，默认为 ``True``。
-
-        返回
-        ----------
-        str
-            逆波兰表达式，常量会被还原为原始数字字符串。
-        """
-        toks = []
-        for idx in ids:
-            if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
-                continue
-            toks.append(self.id_to_token.get(idx, 'UNK'))
-        # 常量还原
-        toks = [self._const_to_str(tk) for tk in toks]
-        return " ".join(toks)
-
-    def _map_to_const(self, val: float) -> str:
-        """
-        将任意浮点数映射到最近的常量桶，并返回其 token 名。
-
-        参数
-        ----------
-        val : float
-            原始浮点数。
-
-        返回
-        ----------
-        str
-            形如 ``"CONST_5"`` 的 token 名称。
-        """
-        closest = min(self.const_buckets, key=lambda x: abs(x - val))
-        return f'CONST_{closest}'
-
-    def _const_to_str(self, token: str) -> str:
-        """
-        将常量 token 名恢复为数字字符串。
-
-        参数
-        ----------
-        token : str
-            形如 ``"CONST_3"`` 的 token。
-
-        返回
-        ----------
-        str
-            ``"3"``；如果传入非常量 token，则原样返回。
-        """
-        if token.startswith('CONST_'):
-            return token.split('_', 1)[1]
-        return token
-
-    @staticmethod
-    def _is_float(s: str) -> bool:
-        """
-        判断字符串能否安全转换为 `float`。
-
-        参数
-        ----------
-        s : str
-            待检测字符串。
-
-        返回
-        ----------
-        bool
-            可转换返回 ``True``，否则 ``False``。
-        """
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-
-
-
-================================================================================
-File: .\train.py
---------------------------------------------------------------------------------
-# train.py
-from combination import AlphaCombinationModel
-from envs import AlphaGenerationEnv
-from generator import RLAlphaGenerator
-
-if __name__ == "__main__":
-    # 1. Load data
-    # 2. Initialize AlphaCombinationModel
-    # 3. Initialize tokenizer 和 AlphaGenerationEnv
-    # 4. Initialize RLAlphaGenerator
-    # 5. 调用 generator.train()
-    # 6. 保存发现的 alphas 和权重
-    pass
-
-
-================================================================================
-File: .\utility.py
---------------------------------------------------------------------------------
-# utility.py
-
-import numpy as np
 import pandas as pd
+import numpy as np
 
-def zscore_normalize(series: pd.Series) -> pd.Series:
-    """
-    Z-score 标准化处理：消除因子的尺度影响
-    """
-    mean = series.mean()
-    std = series.std()
-    if std == 0 or np.isnan(std):
-        return pd.Series(np.zeros_like(series), index=series.index)
-    return (series - mean) / std
 
-def winsorize(series: pd.Series, lower_quantile: float = 0.01, upper_quantile: float = 0.99) -> pd.Series:
+def load_market_data(path: str = "data/rb_20250606_primary.csv", multiplier: int = 10, n: int = 5):
     """
-    异常值截断处理：防止 outlier 扰动因子稳定性
-    """
-    lower = series.quantile(lower_quantile)
-    upper = series.quantile(upper_quantile)
-    return series.clip(lower=lower, upper=upper)
+    读取并预处理原始 A 股行情数据。
 
-def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
-    """
-    信息系数（IC）：衡量因子预测未来收益的能力，Pearson 相关系数
-    """
-    if len(factor) != len(target):
-        raise ValueError("Factor and target length mismatch")
-    if np.std(factor) == 0 or np.std(target) == 0:
-        return 0.0
-    
-    ic = np.corrcoef(factor, target)[0, 1]
-    return float(np.nan_to_num(ic))
+    参数
+    ----------
+    path : str, 可选
+        CSV 文件的本地路径，默认为 ``"data/rb_20250606_primary.csv"``。
+    multiplier: int
+    n: int 可选
+        预测 n 秒之后的收益率
 
-================================================================================
-File: .\__init__.py
---------------------------------------------------------------------------------
+    返回
+    ----------
+    pandas.DataFrame
+        处理后的行情特征表，包含基础字段以及 ``target``（20 日远期收益）列。
+    """
+    # TODO: 这里暂时读取本地文件
+
+    df = pd.read_csv(path, parse_dates=["timestamp"], index_col="timestamp")
+
+    df = df.sort_index()
+
+    df['d_vol'] = df['volume'].diff()
+    df['d_amt'] = df['amount'].diff()
+    df['d_oi']  = df['openInterest'].diff()
+
+    df.loc[df['d_vol'] <= 0, ['d_vol', 'd_amt']] = np.nan
+
+    df['trade_price'] = df['d_amt'] / df['d_vol'] / multiplier
+
+    one_sec = df.resample('1s')
+
+    ohlc = pd.DataFrame({
+        'open' : one_sec['last'].first(),
+        'high' : one_sec['trade_price'].max(),
+        'low'  : one_sec['trade_price'].min(),
+        'close': one_sec['last'].last(),
+        'volume': one_sec['d_vol'].sum(),        # 可选：这一秒真正的成交量
+        'amount': one_sec['d_amt'].sum(),
+        'openInterest': one_sec['d_oi'].sum(),
+    })
+
+    mask = ohlc['high'].isna()
+    ohlc.loc[mask, 'high'] = one_sec['last'].max()[mask]
+    ohlc.loc[mask, 'low']  = one_sec['last'].min()[mask]
+
+    ohlc['target'] = ohlc['close'].pct_change(periods=-n, fill_method=None)
+    return ohlc
 
 

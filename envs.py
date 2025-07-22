@@ -70,7 +70,7 @@ class AlphaGenerationEnv:
         self.sequence.append(action)
         token = self.tokenizer.decode([action])
         reward = 0.0
-        if token == self.tokenizer.sep_token or len(self.sequence) >= self.max_len:
+        if action == self.tokenizer.sep_token_id or len(self.sequence) >= self.max_len:
             expr = self.tokenizer.decode(self.sequence[1:-1])
             reward = self.combo_model.evaluate_alpha(expr)
             self.done = True
@@ -128,6 +128,7 @@ class AlphaGenerationEnv:
                 return 0
             return 1  # 操作数
 
+        stack_depth = 0
         for tk in tokens:
             stack_depth += _delta(tk)
 
