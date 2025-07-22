@@ -1,2 +1,7 @@
 # 忽略所有 __pycache__ 目录
 __pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
