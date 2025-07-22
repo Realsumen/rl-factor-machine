@@ -43,9 +43,9 @@ def ts_mad(series: pd.Series, window: int) -> pd.Series:
         lambda x: np.mean(np.abs(x - np.mean(x))), raw=True
     )
 
-def ts_delta(series: pd.Series, period: int = 1) -> pd.Series:
+def ts_delta(series: pd.Series, window: int = 1) -> pd.Series:
     """Delta(x, t)：与 t 期前的差值"""
-    return series.diff(period)
+    return series.diff(window)
 
 def ts_rank(series: pd.Series, window: int) -> pd.Series:
     """滚动排序百分位"""
@@ -68,9 +68,9 @@ def ts_wma(series: pd.Series, window: int) -> pd.Series:
         lambda x: np.dot(x, weights) / weights.sum(), raw=True
     )
 
-def ts_ema(series: pd.Series, span: int) -> pd.Series:
+def ts_ema(series: pd.Series, window: int) -> pd.Series:
     """EMA(x, t)：指数移动平均（span 可理解为 t）"""
-    return series.ewm(span=span, adjust=False).mean()
+    return series.ewm(span=window, adjust=False).mean()
 
 
 # -----------------------------
@@ -88,8 +88,8 @@ def ts_zscore(series: pd.Series, window: int) -> pd.Series:
     """时序标准分"""
     return (series - ts_mean(series, window)) / ts_std(series, window)
 
-def ts_return(series: pd.Series, period: int = 1) -> pd.Series:
+def ts_return(series: pd.Series, window: int = 1) -> pd.Series:
     """周期收益率"""
-    return series.pct_change(period)
+    return series.pct_change(window)
 
 

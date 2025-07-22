@@ -2,6 +2,8 @@
 from combination import AlphaCombinationModel
 from tokenizer import AlphaTokenizer
 from typing import List
+from rpn_type_sim import RPNTypeSimulator
+
 
 
 class AlphaGenerationEnv:
@@ -32,6 +34,7 @@ class AlphaGenerationEnv:
         self.combo_model = combo_model
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.type_sim = RPNTypeSimulator(tokenizer)
         self.reset()
 
     def reset(self):
@@ -68,10 +71,10 @@ class AlphaGenerationEnv:
             预留调试信息，当前为空字典。
         """
         self.sequence.append(action)
-        token = self.tokenizer.decode([action])
         reward = 0.0
         if action == self.tokenizer.sep_token_id or len(self.sequence) >= self.max_len:
-            expr = self.tokenizer.decode(self.sequence[1:-1])
+            expr = self.tokenizer.decode(self.sequence, remove_special_tokens=True)
+            print(expr)
             reward = self.combo_model.evaluate_alpha(expr)
             self.done = True
         obs = self._get_obs()
@@ -89,81 +92,19 @@ class AlphaGenerationEnv:
         return self.sequence
 
     def valid_actions(self) -> List[int]:
-        """
-        计算当前状态下的合法动作集合，用于 Invalid-Action-Mask。
-
-        规则（基于逆波兰表达式 RPN）
-        ------------------------------------------------------------
-        1. 维护一个“栈深”计数：
-           • 操作数（基础字段或常量）   → 栈深 +1
-           • 算子（arity = n）         → 栈深 −(n-1)
-        2. 任何前缀片段都必须满足栈深 ≥ 0（否则语法非法）。
-        3. 仅当栈深 == 1 时才允许收尾 `[SEP]`。
-        4. 生成过程中禁止再次选择 `[BOS]`、`[PAD]`。
-        5. 若已接近最大长度，只允许 `[SEP]`。
-        """
-        # ---------------- 终止态快速返回 ----------------
-        if self.done:
-            return []  # Episode 已结束
-
-        # ---------- 1. 当前栈深 -------------------------------------------------
-        #    跳过首个 [BOS]；若最后已是 [SEP]，说明逻辑上应已 done，但稳妥起见再校验
-        sep_str = self.tokenizer.id_to_token[self.tokenizer.sep_token_id]
-        tokens = [self.tokenizer.id_to_token[t] for t in self.sequence[1:]]
-        if tokens and tokens[-1] == sep_str:
-            return []
-
-        #   构建 「算子 → arity」 映射（含四则运算）
-        import inspect, operators
-
-        op_arity = {"+": 2, "-": 2, "*": 2, "/": 2}
-        for name, fn in inspect.getmembers(operators, inspect.isfunction):
-            op_arity[name] = len(inspect.signature(fn).parameters)
-
-        def _delta(tok: str) -> int:
-            """token 对栈深的增量"""
-            if tok in op_arity:  # 算子
-                return 1 - op_arity[tok]
-            if tok in self.tokenizer.special_tokens:  # [BOS]/[SEP]/[PAD]
-                return 0
-            return 1  # 操作数
-
-        stack_depth = 0
-        for tk in tokens:
-            stack_depth += _delta(tk)
-
-         # ---------- 2. 若长度已至上限-1，则只能收尾 ------------------------------
-        if len(self.sequence) >= self.max_len - 1:
-            return [self.tokenizer.sep_token_id]
-
-        # ---------- 3. 枚举所有 token，筛选合法动作 -----------------------------
-        valid: List[int] = []
-        remaining_steps = self.max_len - len(self.sequence) - 1  # 预留结尾 [SEP]
+        valid = []
+        prefix = [self.tokenizer.id_to_token[t] for t in self.sequence[1:]]
+        remaining = self.max_len - len(self.sequence) - 1
 
         for tid in range(self.tokenizer.vocab_size):
             tok = self.tokenizer.id_to_token[tid]
-
-            # 跳过无意义或禁止的特殊标记
             if tok in ("[BOS]", "[PAD]"):
                 continue
-
-            # ---- A. 结束符 `[SEP]` ----
             if tok == "[SEP]":
-                if stack_depth == 1:               # 仅当栈深恰好为 1 可收尾
+                if self.type_sim.simulate(tuple(prefix)) == (self.type_sim.S,):
                     valid.append(tid)
                 continue
-
-            # ---- B. 普通 token ----
-            nd = stack_depth + _delta(tok)
-            # 合法性 1：中途栈深不得为负
-            if nd < 0:
-                continue
-            # 合法性 2：后续仍需有可能在剩余步数内归结到栈深 1
-            #   最悲观情形：后面全用二元算子，每步栈深 -1，再加结尾 [SEP]
-            #   所需最少步 = (nd - 1)   （降到 1） + 1（收尾）
-            if nd - 1 + 1 > remaining_steps:
-                continue
-
-            valid.append(tid)
-
+            if self.type_sim.is_valid_append(prefix, tok, remaining):
+                valid.append(tid)
         return valid
+

@@ -236,10 +236,9 @@ class RLAlphaGenerator:
             # -------- Invalid-action-mask --------
             valid = self.env.valid_actions()
             mask = torch.full((self.vocab_size,), float('-inf'), device=self.device)
-            mask[valid] = 0.0                                # 合法动作设置成 0，其它仍为 −inf
-            logits = logits + mask                          # 非法动作 logits 变为 −inf
+            mask[valid] = 0.0                                   # 合法动作设置成 0，其它仍为 −inf
+            logits = logits + mask                              # 非法动作 logits 变为 −inf
             dist = Categorical(logits=logits)
-            
             action = dist.sample()
             logp = dist.log_prob(action)
 
