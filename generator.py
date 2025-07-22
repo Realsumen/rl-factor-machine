@@ -235,16 +235,28 @@ class RLAlphaGenerator:
 
             # -------- Invalid-action-mask --------
             valid = self.env.valid_actions()
-            mask = torch.full((self.vocab_size,), float('-inf'), device=self.device)
-            mask[valid] = 0.0                                   # 合法动作设置成 0，其它仍为 −inf
-            logits = logits + mask                              # 非法动作 logits 变为 −inf
-            dist = Categorical(logits=logits)
-            action = dist.sample()
-            logp = dist.log_prob(action)
+            if len(valid) == 0:
+                # 无合法动作 → 强制收尾并惩罚
+                sep_id = self.env.tokenizer.sep_token_id
+                obs, _, _, _ = self.env.step(sep_id)
+                action = torch.tensor(sep_id, device=self.device)
+                logp = torch.tensor(0.0, device=self.device)
+                print(obs, h_v)
+                value, h_v = self.value_net(obs, h_v)
+                reward = -1.0
+                done = True
+            else:
+                mask = torch.full((self.vocab_size,), float('-inf'), device=self.device)
+                mask[valid] = 0.0                                   # 合法动作设置成 0，其它仍为 −inf
+                logits = logits + mask                              # 非法动作 logits 变为 −inf
+                dist = Categorical(logits=logits)
+                action = dist.sample()
+                logp = dist.log_prob(action)
 
-            value, h_v = self.value_net(obs, h_v)
+                value, h_v = self.value_net(obs, h_v)
 
-            next_obs, reward, done, _ = self.env.step(action.item())
+                next_obs, reward, done, _ = self.env.step(action.item())
+
             states.append(obs.squeeze(0))
             actions.append(action)
             logps.append(logp)

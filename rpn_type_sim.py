@@ -20,6 +20,7 @@ class RPNTypeSimulator:
     def __init__(self, tokenizer: AlphaTokenizer, const_param_names='window'):
         # tokenizer 用于识别 base_fields、special_tokens
         self.tok = tokenizer
+        self.max_run = 2
         self.base_fields = set(tokenizer.base_fields)
         self.const_prefix = "CONST_"
         self.special_tokens = set(tokenizer.special_tokens)
@@ -76,16 +77,19 @@ class RPNTypeSimulator:
                 return None
         return tuple(stack)
 
-    def is_valid_append(
-        self, prefix: Sequence[str], new_token: str, remaining_steps: int
-    ) -> bool:
-        """
-        判断在 prefix 后追加 new_token 是否仍
-        
-        
-        有可能归约到单一 Series (['S'])。
-        remaining_steps = 可放入的 payload token 数 (不含 [SEP])
-        """
+    def is_valid_append(self, prefix, new_token, remaining_steps):
+        # 1) 限制最大连续操作数数目
+        # 看 prefix 末尾连续多少操作数
+        run = 0
+        for tk in reversed(prefix):
+            if tk in self.base_fields or tk.startswith(self.const_prefix) or self._is_float(tk):
+                run += 1
+            else:
+                break
+        # 如果已经 run >= max_run，且 new_token 又是操作数，就拦截
+        if run >= self.max_run and (new_token in self.base_fields or new_token.startswith(self.const_prefix) or self._is_float(new_token)):
+            return False
+
         pre = self.simulate(tuple(prefix))
         if pre is None:
             return False

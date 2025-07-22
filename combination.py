@@ -152,6 +152,7 @@ class AlphaCombinationModel:
         Raises:
             ValueError: 当表达式解析或运算失败时。
         """
+        print(expr)
         new_alpha = self._compute_alpha_from_expr(expr)
         norm = self._maybe_normalize(new_alpha)
         key = ('expr_ic', expr)

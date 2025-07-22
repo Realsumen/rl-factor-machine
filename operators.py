@@ -5,9 +5,9 @@ import numpy as np
 # Time-Series Operators (TS)
 # -----------------------------
 
-def ref(series: pd.Series, period: int) -> pd.Series:
+def ref(series: pd.Series, window: int) -> pd.Series:
     """Ref(x, t)：滞后期 t 的值"""
-    return series.shift(period)
+    return series.shift(window)
 
 def ts_mean(series: pd.Series, window: int) -> pd.Series:
     """Mean(x, t)：滚动均值"""
