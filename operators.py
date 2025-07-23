@@ -1,5 +1,45 @@
 import pandas as pd
 import numpy as np
+import inspect
+from typing import List
+
+# -----------------------------
+# Basic Operators
+# -----------------------------
+
+ARITH_OPS = {'add', 'sub', 'mul', 'div',}
+
+def add(x: pd.Series, y: pd.Series):
+    return x + y
+
+def sub(x: pd.Series, y: pd.Series):
+    return x - y
+
+def mul(x: pd.Series, y: pd.Series):
+    return x * y
+
+def div(x: pd.Series, y: pd.Series):
+    return x / y.replace(0, np.nan)  # 防止除 0
+
+# -----------------------------
+# Unary Operators
+# -----------------------------
+
+def abs_(x: pd.Series) -> pd.Series:
+    return x.abs()
+
+def sign(x: pd.Series) -> pd.Series:
+    return np.sign(x)
+
+def log(x: pd.Series) -> pd.Series:
+    return np.log(x.replace(0, np.nan))  # 避免 log(0)
+
+def sqrt(x: pd.Series) -> pd.Series:
+    return np.sqrt(x)
+
+def neg(x: pd.Series) -> pd.Series:
+    return -x
+
 
 # -----------------------------
 # Time-Series Operators (TS)
@@ -28,6 +68,14 @@ def ts_std(series: pd.Series, window: int) -> pd.Series:
 def ts_var(series: pd.Series, window: int) -> pd.Series:
     """Var(x, t)：滚动方差"""
     return series.rolling(window).var()
+
+def ts_skew(series: pd.Series, window: int) -> pd.Series:
+    """滚动偏度"""
+    return series.rolling(window).skew()
+
+def ts_kurt(series: pd.Series, window: int) -> pd.Series:
+    """滚动峰度"""
+    return series.rolling(window).kurt()
 
 def ts_max(series: pd.Series, window: int) -> pd.Series:
     """Max(x, t)：滚动最大值"""
@@ -92,4 +140,26 @@ def ts_return(series: pd.Series, window: int = 1) -> pd.Series:
     """周期收益率"""
     return series.pct_change(window)
 
+
+FUNC_MAP: dict[str, tuple[callable, int, List[str]]] = {}
+
+for name, fn in inspect.getmembers(__import__(__name__), inspect.isfunction):
+    if name.startswith("_"):
+        continue
+
+    if name in ARITH_OPS:
+        FUNC_MAP[name] = (fn, 2, ['Any', 'Any'])  # 'Any' 表示 Scalar 或 Series 都接受
+        continue
+
+    sig = inspect.signature(fn)
+    param_types = []
+    for param in sig.parameters.values():
+        pname = param.name
+        if pname in ('x', 'y', 'series'):
+            param_types.append('Series')
+        elif pname in ('window', 'n'):
+            param_types.append('Scalar_INT')
+        else:
+            raise RuntimeError("Unrecognizable param type.")
+    FUNC_MAP[name] = (fn, len(param_types), param_types)
 

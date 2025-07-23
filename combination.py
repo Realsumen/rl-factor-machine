@@ -59,7 +59,6 @@ class AlphaCombinationModel:
         self.data: pd.DataFrame = df
         self._target = df[target_col].values.astype(np.float64)
 
-
     def update_with(self, new_alpha: np.ndarray, expr: str):
         """
         将新因子加入池中并更新组合：
@@ -72,7 +71,6 @@ class AlphaCombinationModel:
             new_alpha (np.ndarray): 新因子的原始序列数据，长度与注入的行情一致。
             expr (str): 生成该因子的 RPN 表达式字符串，用于记录及缓存键。
         """
-        # 归一化
         norm = winsorize(zscore_normalize(new_alpha))
         key = ('ic', tuple(norm))
         if key in self._cache:
@@ -152,8 +150,8 @@ class AlphaCombinationModel:
         Raises:
             ValueError: 当表达式解析或运算失败时。
         """
-        print(expr)
         new_alpha = self._compute_alpha_from_expr(expr)
+        print(expr)
         norm = self._maybe_normalize(new_alpha)
         key = ('expr_ic', expr)
         if key not in self._cache:
@@ -209,50 +207,38 @@ class AlphaCombinationModel:
         tokens: List[str] = expr.strip().split()
         stack: List[Union[pd.Series, float]] = []
 
-        # 预构建 “函数名 → (Callable, arity)” 映射
-        func_map: Dict[str, Tuple[Callable, int]] = {}
-        for name, fn in inspect.getmembers(operators, inspect.isfunction):
-            sig = inspect.signature(fn)
-            func_map[name] = (fn, len(sig.parameters))
+        func_map: Dict[str, Tuple[Callable, int]] = operators.FUNC_MAP
 
         for tk in tokens:
-            # -- 1. 基础变量 ----------------------------------------------------
             if tk in self.data.columns:
                 stack.append(self.data[tk])
-            # -- 2. 数值常量 ----------------------------------------------------
             elif _is_float(tk):
                 val = float(tk)
                 if val.is_integer():
                     stack.append(int(val))
                 else:
                     stack.append(float(tk))
-            # -- 3. 函数 / 运算符 ----------------------------------------------
             elif tk in func_map:
-                fn, arity = func_map[tk]
+                fn, arity, _ = func_map[tk]
                 if len(stack) < arity:
                     raise ValueError(f"RPN 表达式参数不足：{tk}")
-                # 注意：弹栈顺序需反转以保持原来顺序
-                args = [stack.pop() for _ in range(arity)][::-1]
+                args = [stack.pop() for _ in range(arity)][::-1] # 注意：弹栈顺序需反转以保持原来顺序
                 res = fn(*args)
-                stack.append(res)
-            # -- 4. 支持最常见的四则运算符 -------------------------------------
-            elif tk in {"+", "-", "*", "/"}:
-                if len(stack) < 2:
-                    raise ValueError(f"RPN 表达式参数不足：{tk}")
-                b, a = stack.pop(), stack.pop()
-                if tk == "+": res = a + b
-                elif tk == "-": res = a - b
-                elif tk == "*": res = a * b
-                elif tk == "/": res = a / (b.replace(0, np.nan) if isinstance(b, pd.Series) else (b if b != 0 else np.nan))
                 stack.append(res)
             else:
                 raise ValueError(f"未知 token：{tk}")
 
         if len(stack) != 1:
-            raise ValueError("RPN 表达式最终栈深度应为 1")
-        # 返回 numpy 数组，后续会做 winsorize + z-score
-        series = stack[0]
-        return np.asarray(series.values, dtype=np.float64)
+            raise ValueError(f"RPN 表达式最终栈深度应为 1, 计算时为: {len(stack)}")
+        output = stack[0]
+        if np.isscalar(output):
+            series = pd.Series(output, index=self.data.index)
+        elif isinstance(output, pd.Series):
+            series = output.reindex(self.data.index)
+        else:
+            series = pd.Series(output, index=self.data.index)
+
+        return series.values.astype(np.float64)
     
     def _maybe_normalize(self, alpha: np.ndarray) -> np.ndarray:
         """

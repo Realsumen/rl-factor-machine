@@ -32,30 +32,27 @@ class AlphaTokenizer:
         self.base_fields = base_fields
         self.const_buckets = const_buckets
 
-        # 特殊 token
         self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
-
-        # 基础字段 token
         field_tokens = base_fields
-
-        # 常量 token
         const_tokens = [f'CONST_{c}' for c in const_buckets]
+        op_tokens: List = list(operators.FUNC_MAP.keys())
+        
+        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens
 
-        # 算子 token：自动扫描 operators.py
-        op_tokens = []
-        for name, fn in inspect.getmembers(operators, inspect.isfunction):
-            if not name.startswith("_"):
-                op_tokens.append(name)
-
-        # 词表
-        arith = ['+', '-', '*', '/']
-        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens + arith
-
-        # ID ↔ Token 映射
         self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
         self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
+        self.operand_type_map: dict[str, str] = {}
 
-        # 便捷属性
+        for f in self.base_fields:
+            self.operand_type_map[f] = "Series"
+        for c in self.const_buckets:
+            tok = f"CONST_{c}"
+            # 先把 c 转成 float，再看是不是整数
+            if float(c).is_integer():
+                self.operand_type_map[tok] = "Scalar_INT"
+            else:
+                self.operand_type_map[tok] = "Scalar_FLOAT"
+
         self.pad_token_id = self.token_to_id['[PAD]']
         self.bos_token_id = self.token_to_id['[BOS]']
         self.sep_token_id = self.token_to_id['[SEP]']

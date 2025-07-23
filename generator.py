@@ -235,17 +235,8 @@ class RLAlphaGenerator:
 
             # -------- Invalid-action-mask --------
             valid = self.env.valid_actions()
-            print(self.env.sequence, self.env.tokenizer.decode(self.env.sequence))
             if len(valid) == 0:
-                # 无合法动作 → 强制收尾并惩罚
-                sep_id = self.env.tokenizer.sep_token_id
-                obs, _, _, _ = self.env.step(sep_id)
-                action = torch.tensor(sep_id, device=self.device)
-                logp = torch.tensor(0.0, device=self.device)
-                print(obs, h_v)
-                value, h_v = self.value_net(obs, h_v)
-                reward = -1.0
-                done = True
+                raise RuntimeError("没有合法动作")
             else:
                 mask = torch.full((self.vocab_size,), float('-inf'), device=self.device)
                 mask[valid] = 0.0                                   # 合法动作设置成 0，其它仍为 −inf
@@ -258,7 +249,15 @@ class RLAlphaGenerator:
 
                 next_obs, reward, done, _ = self.env.step(action.item())
 
-            states.append(obs.squeeze(0))
+            pad_id = self.env.tokenizer.pad_token_id
+            raw = obs.squeeze(0)  # 长度不定
+            pad = torch.full((self.max_seq_len,), pad_id, dtype=torch.long, device=self.device)
+            if raw.size(0) >= self.max_seq_len:
+                pad[:] = raw[-self.max_seq_len:]
+            else:
+                pad[-raw.size(0):] = raw
+            
+            states.append(pad)
             actions.append(action)
             logps.append(logp)
             rewards.append(torch.tensor(reward, device=self.device, dtype=torch.float32))
