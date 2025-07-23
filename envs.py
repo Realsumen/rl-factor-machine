@@ -74,7 +74,10 @@ class AlphaGenerationEnv:
         reward = 0.0
         if action == self.tokenizer.sep_token_id or len(self.sequence) >= self.max_len:
             expr = self.tokenizer.decode(self.sequence, remove_special_tokens=True)
-            reward = self.combo_model.evaluate_alpha(expr)
+            try:
+                reward = self.combo_model.evaluate_alpha(expr)
+            except ValueError as e:
+                reward = -1.0
             self.done = True
         obs = self._get_obs()
         return obs, reward, self.done, {}

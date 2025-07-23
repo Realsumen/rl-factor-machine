@@ -2,6 +2,10 @@
 
 import numpy as np
 import pandas as pd
+import os
+import random
+import torch
+
 
 def zscore_normalize(alpha: np.ndarray) -> pd.Series:
     """
@@ -45,3 +49,25 @@ def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
         return 0.0
 
     return float(np.corrcoef(f, t)[0, 1])
+
+def set_random_seed(SEED: int = 42):
+    """
+    固定全局随机数种子，确保实验可复现。
+    参数：
+        seed (int): 随机数种子，默认 42。
+    """
+    # 1. 系统级别
+    os.environ["PYTHONHASHSEED"] = str(SEED)
+
+    # 2. Python 自带的 random
+    random.seed(SEED)
+
+    # 3. NumPy
+    np.random.seed(SEED)
+
+    # 4. PyTorch
+    torch.manual_seed(SEED)
+    torch.cuda.manual_seed_all(SEED)
+    # 以下两行可保证 cuDNN 的确定性（可能会略微牺牲一点速度）
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False

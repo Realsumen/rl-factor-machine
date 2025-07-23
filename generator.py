@@ -115,7 +115,7 @@ class RLAlphaGenerator:
             env: 强化学习环境，需支持 reset(), step(action), valid_actions() 接口。
             config: 包含网络和 PPO 超参数的配置字典。
         """
-        self.env = env
+        self.env: AlphaGenerationEnv = env
         self.vocab_size = config["vocab_size"]
         self.hidden_dim = config.get("hidden_dim", 128)
         self.device = config.get("device", "cpu")
@@ -235,6 +235,7 @@ class RLAlphaGenerator:
 
             # -------- Invalid-action-mask --------
             valid = self.env.valid_actions()
+            print(self.env.sequence, self.env.tokenizer.decode(self.env.sequence))
             if len(valid) == 0:
                 # 无合法动作 → 强制收尾并惩罚
                 sep_id = self.env.tokenizer.sep_token_id
