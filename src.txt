@@ -832,7 +832,7 @@ File: .\operators.py
 import pandas as pd
 import numpy as np
 import inspect
-from typing import List
+from typing import List, Union
 
 # -----------------------------
 # Basic Operators
@@ -840,17 +840,24 @@ from typing import List
 
 ARITH_OPS = {'add', 'sub', 'mul', 'div',}
 
-def add(x: pd.Series, y: pd.Series):
+ScalarOrSeries = Union[pd.Series, float, int]
+
+def add(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
     return x + y
 
-def sub(x: pd.Series, y: pd.Series):
+def sub(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
     return x - y
 
-def mul(x: pd.Series, y: pd.Series):
+def mul(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
     return x * y
 
-def div(x: pd.Series, y: pd.Series):
-    return x / y.replace(0, np.nan)  # 防止除 0
+def div(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
+    # 避免除以0（支持 Series 和标量）
+    if isinstance(y, pd.Series):
+        y = y.replace(0, np.nan)
+    elif y == 0:
+        y = np.nan
+    return x / y
 
 # -----------------------------
 # Unary Operators
