@@ -122,7 +122,6 @@ class AlphaTokenizer:
             if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
                 continue
             toks.append(self.id_to_token.get(idx, 'UNK'))
-        # 常量还原
         toks = [self._const_to_str(tk) for tk in toks]
         return " ".join(toks)
 
@@ -160,6 +159,53 @@ class AlphaTokenizer:
         if token.startswith('CONST_'):
             return token.split('_', 1)[1]
         return token
+
+    def rpn_to_infix(self, rpn: str) -> str:
+        """
+        将逆波兰表达式 (RPN) 转换为可读的中缀表达式。
+
+        参数
+        ----------
+        rpn : str
+            形如 `"close 5 ts_mean high low sub mul"` 的 RPN 式字符串。
+
+        返回
+        ----------
+        str
+            对应的中缀表达式字符串，例如 `"(ts_mean(close, 5) * (high - low))"`。
+        """
+        from operators import FUNC_MAP
+
+        stack: List[str] = []
+        tokens = rpn.strip().split()
+        for tk in tokens:
+            # 操作符
+            if tk in FUNC_MAP:
+                fn, arity, _ = FUNC_MAP[tk]
+                if arity == 1:
+                    a = stack.pop()
+                    stack.append(f"{tk}({a})")
+                elif arity == 2:
+                    b = stack.pop()
+                    a = stack.pop()
+                    if tk == "add":
+                        stack.append(f"({a} + {b})")
+                    elif tk == "sub":
+                        stack.append(f"({a} - {b})")
+                    elif tk == "mul":
+                        stack.append(f"({a} * {b})")
+                    elif tk == "div":
+                        stack.append(f"({a} / {b})")
+                    else:
+                        stack.append(f"{tk}({a}, {b})")
+                else:
+                    args = ", ".join(stack[-arity:])
+                    stack = stack[:-arity]
+                    stack.append(f"{tk}({args})")
+            else:
+                val = self._const_to_str(tk)
+                stack.append(val)
+        return stack[0] if stack else ""
 
     @staticmethod
     def _is_float(s: str) -> bool:

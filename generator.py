@@ -1,3 +1,4 @@
+# generator.py
 from typing import List, Tuple, Dict, Any
 import torch
 import torch.nn as nn
@@ -246,9 +247,10 @@ class RLAlphaGenerator:
                 logp = dist.log_prob(action)
 
                 value, h_v = self.value_net(obs, h_v)
-
+                value = value.squeeze(0).detach()
+            
                 next_obs, reward, done, _ = self.env.step(action.item())
-
+            
             pad_id = self.env.tokenizer.pad_token_id
             raw = obs.squeeze(0)  # 长度不定
             pad = torch.full((self.max_seq_len,), pad_id, dtype=torch.long, device=self.device)
@@ -262,7 +264,7 @@ class RLAlphaGenerator:
             logps.append(logp)
             rewards.append(torch.tensor(reward, device=self.device, dtype=torch.float32))
             dones.append(done)
-            values.append(value.squeeze(0))
+            values.append(value)
 
             if done:
                 obs = torch.tensor([self.env.reset()], device=self.device)

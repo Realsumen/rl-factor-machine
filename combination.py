@@ -58,46 +58,6 @@ class AlphaCombinationModel:
         self.data: pd.DataFrame = df
         self._target = df[target_col].values.astype(np.float64)
 
-    def update_with(self, new_alpha: np.ndarray, expr: str):
-        """
-        将新因子加入池中并更新组合：
-          1. 对原始因子序列做 winsorize 和 z-score 标准化。
-          2. 计算并缓存该因子的 IC。
-          3. 添加至因子池后，重优化线性权重。
-          4. 超出容量时剔除贡献最小的因子。
-
-        Args:
-            new_alpha (np.ndarray): 新因子的原始序列数据，长度与注入的行情一致。
-            expr (str): 生成该因子的 RPN 表达式字符串，用于记录及缓存键。
-        """
-        norm = winsorize(zscore_normalize(new_alpha))
-        key = ('ic', tuple(norm))
-        if key in self._cache:
-            ic = self._cache[key]
-        else:
-            target = self._load_validation_target()
-            ic = information_coefficient(norm, target)
-            self._cache[key] = ic
-
-        # 更新因子池
-        self.alphas.append(new_alpha)
-        self.norm_alphas.append(norm)
-        self.ic_list.append(ic)
-        self.expr_list.append(expr)          # 记录表达式
-
-        # 若是首因子直接赋权 1；否则重优化权重
-        if len(self.norm_alphas) == 1:
-            self.weights = [1.0]
-        else:
-            self._reoptimize_weights()
-
-        # 超限时剔除贡献最小因子
-        if len(self.alphas) > self.max_pool_size:
-            contrib = [abs(w * ic) for w, ic in zip(self.weights, self.ic_list)]
-            idx = contrib.index(min(contrib))
-            for lst in (self.alphas, self.norm_alphas, self.ic_list, self.weights):
-                lst.pop(idx)
-
     def add_alpha_expr(self, expr: str) -> float:
         """
         根据 RPN 表达式计算新因子，并将其加入因子池。
@@ -111,9 +71,8 @@ class AlphaCombinationModel:
         Raises:
             ValueError: 当表达式格式错误或运算失败时。
         """
-        new_alpha = self._compute_alpha_from_expr(expr)
-        ic = self.evaluate_alpha(expr)                  # 里面自带缓存
-        self.update_with(new_alpha, expr)
+        raw, norm, ic = self._compute_alpha_and_ic(expr)
+        self._update_pool(raw, norm, ic, expr)
         return ic
 
     def _reoptimize_weights(self):
@@ -137,26 +96,67 @@ class AlphaCombinationModel:
         self._cache['weights'] = res.x.copy()
 
     def evaluate_alpha(self, expr: str) -> float:
+        """只评估 IC，不入池。"""
+        _, _, ic = self._compute_alpha_and_ic(expr)
+        return ic
+
+    def _compute_alpha_and_ic(self, expr: str) -> Tuple[np.ndarray, np.ndarray, float]:
         """
-        直接根据 RPN 表达式计算并返回单因子 IC（带缓存）。
-
-        Args:
-            expr (str): RPN 表达式字符串。
-
-        Returns:
-            float: 该表达式生成因子的 Pearson IC。
-
-        Raises:
-            ValueError: 当表达式解析或运算失败时。
+        统一计算入口：expr -> raw alpha, norm alpha, ic（全程带缓存）
         """
-        new_alpha = self._compute_alpha_from_expr(expr)
-        print(expr)
-        norm = self._maybe_normalize(new_alpha)
-        key = ('expr_ic', expr)
-        if key not in self._cache:
-            target = self._load_validation_target()
-            self._cache[key] = information_coefficient(norm, target)
-        return self._cache[key]
+        # 1) raw
+        key_raw = ('raw_alpha', expr)
+        if key_raw in self._cache:
+            raw = self._cache[key_raw]
+        else:
+            raw = self._compute_alpha_from_expr(expr)
+            raw = np.nan_to_num(raw, nan=0.0)
+            self._cache[key_raw] = raw
+
+        # 2) norm
+        key_norm = ('norm_alpha', expr)
+        if key_norm in self._cache:
+            norm = self._cache[key_norm]
+        else:
+            norm = self._maybe_normalize(raw)
+            self._cache[key_norm] = norm
+
+        # 3) ic
+        key_ic = ('expr_ic', expr)
+        if key_ic in self._cache:
+            ic = self._cache[key_ic]
+        else:
+            if np.all(np.isnan(raw)):
+                ic = -1.0
+            else:
+                target = self._load_validation_target()
+                ic = information_coefficient(norm, target)
+            self._cache[key_ic] = ic
+
+        return raw, norm, ic
+
+    def _update_pool(self, raw: np.ndarray, norm: np.ndarray, ic: float, expr: str) -> None:
+        """
+        给定已经算好的 raw/norm/ic，把它们塞进因子池并重优化权重。
+        """
+        # 1. 加入池
+        self.alphas.append(raw)
+        self.norm_alphas.append(norm)
+        self.ic_list.append(ic)
+        self.expr_list.append(expr)
+
+        # 2. 权重更新
+        if len(self.norm_alphas) == 1:
+            self.weights = [1.0]
+        else:
+            self._reoptimize_weights()
+
+        # 3. 超出容量时剔除贡献最小的因子
+        if len(self.alphas) > self.max_pool_size:
+            contrib = [abs(w * ic_) for w, ic_ in zip(self.weights, self.ic_list)]
+            idx = int(np.argmin(contrib))
+            for lst in (self.alphas, self.norm_alphas, self.ic_list, self.weights, self.expr_list):
+                lst.pop(idx)
 
     def score(self) -> float:
         """

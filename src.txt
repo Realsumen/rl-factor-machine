@@ -1,7 +1,240 @@
 ================================================================================
-File: .\alpha_generation_env.py
+File: ./unit_test.py
 --------------------------------------------------------------------------------
-# env.py
+# %% [markdown]
+# ### 这个 notebook 用来读取文件，并测试一些方法
+
+# %%
+import os
+import numpy as np
+
+
+def get_all_py_files(root_dir: str) -> list:
+    """
+    获取指定目录及其子目录下的所有 .py 文件路径。
+
+    Args:
+        root_dir (str): 起始目录路径。
+
+    Returns:
+        list: 包含所有 .py 文件完整路径的列表。
+    """
+    py_files = []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for file in filenames:
+            if file.endswith(".py"):
+                py_files.append(os.path.join(dirpath, file))
+    return py_files
+
+
+def write_all_py_contents_to_output(
+    py_files: list, output_path: str = "src.txt"
+) -> None:
+    """
+    将所有 .py 文件的内容写入一个文本文件中，并打印文件名作为分隔。
+
+    Args:
+        py_files (list): .py 文件路径列表。
+        output_path (str): 输出文件路径。
+    """
+    with open(output_path, "w", encoding="utf-8") as out_file:
+        for path in py_files:
+            out_file.write(f"{'=' * 80}\n")
+            out_file.write(f"File: {path}\n")
+            out_file.write(f"{'-' * 80}\n")
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    out_file.write(f.read())
+            except Exception as e:
+                out_file.write(f"⚠️ Error reading {path}: {e}\n")
+            out_file.write("\n\n")
+
+
+if True:
+    root_directory = "."  # 当前目录
+    all_py_files = get_all_py_files(root_directory)
+    write_all_py_contents_to_output(all_py_files)
+    print(f"📄 所有 Python 文件内容已写入 src.txt（共 {len(all_py_files)} 个文件）")
+
+
+# %%
+import importlib
+from utility import set_random_seed
+
+
+def reload_components():
+    """
+    重新加载以下模块，以便在开发过程中即时生效：
+      - data.load_market_data
+      - tokenizer.AlphaTokenizer
+      - combination.AlphaCombinationModel
+      - envs.AlphaGenerationEnv
+      - generator.RLAlphaGenerator
+    """
+    import data, tokenizer, combination, alpha_generation_env, generator
+
+    importlib.reload(data)
+    importlib.reload(tokenizer)
+    importlib.reload(combination)
+    importlib.reload(alpha_generation_env)
+    importlib.reload(generator)
+
+    # 重新绑定到本地名称（可选）
+    from data import load_market_data
+    from tokenizer import AlphaTokenizer
+    from combination import AlphaCombinationModel
+    from alpha_generation_env import AlphaGenerationEnv
+    from generator import RLAlphaGenerator
+
+    return {
+        "load_market_data": load_market_data,
+        "AlphaTokenizer": AlphaTokenizer,
+        "AlphaCombinationModel": AlphaCombinationModel,
+        "AlphaGenerationEnv": AlphaGenerationEnv,
+        "RLAlphaGenerator": RLAlphaGenerator,
+    }
+
+
+components = reload_components()
+
+
+# %% [markdown]
+# ### 1.测试 AlphaCombinationModel._compute_alpha_from_expr
+
+# %%
+from combination import AlphaCombinationModel
+from data import load_market_data
+
+df = load_market_data()
+model = AlphaCombinationModel()
+model.inject_data(df, target_col="target")
+
+# 表达式：close 的 100 秒均值
+expr = "close 100 ts_mean"
+alpha = model._compute_alpha_from_expr(expr)
+
+print("alpha shape:", alpha.shape)
+print("alpha sample:", alpha[~np.isnan(alpha)][:5])
+
+
+# %% [markdown]
+# ###  2. 测试 AlphaCombinationModel.add_alpha_expr
+
+# %%
+ic = model.add_alpha_expr("high low sub 100 ts_max")
+print("该因子的 IC 为：", ic)
+print("当前池中因子数：", len(model.alphas))
+
+
+# %% [markdown]
+# ### 3. 测试 AlphaTokenizer.encode / decode
+
+# %%
+from tokenizer import AlphaTokenizer
+
+tokenizer = AlphaTokenizer()
+
+expr = "close 5 ts_mean"
+ids = tokenizer.encode(expr)
+decoded = tokenizer.decode(ids)
+
+print("Token IDs:", ids)
+print("Decoded expr:", decoded)
+
+
+# %% [markdown]
+# ### 4. 测试 AlphaGenerationEnv.reset / step
+
+# %%
+from alpha_generation_env import AlphaGenerationEnv
+from combination import AlphaCombinationModel
+from tokenizer import AlphaTokenizer
+from data import load_market_data
+
+df = load_market_data()
+combo = AlphaCombinationModel()
+combo.inject_data(df, target_col="target")
+tokenizer = AlphaTokenizer()
+env = AlphaGenerationEnv(combo, tokenizer)
+
+obs = env.reset()
+print("初始状态 token IDs:", obs)
+
+valid = env.valid_actions()
+action = valid[1]
+obs2, reward, done, info = env.step(action)
+print("新状态:", obs2)
+print("Reward:", reward, "Done:", done)
+
+
+# %% [markdown]
+# ### 5. 测试 PolicyNetwork / ValueNetwork 输出维度
+
+# %%
+import torch
+from generator import PolicyNetwork, ValueNetwork
+
+vocab_size = 50
+seq_len = 6
+hidden_dim = 64
+device = "cpu"
+
+x = torch.randint(0, vocab_size, (1, seq_len))  # batch_size=1
+policy = PolicyNetwork(vocab_size, hidden_dim).to(device)
+value = ValueNetwork(vocab_size, hidden_dim).to(device)
+
+h0_p = policy.init_hidden(1, device)
+logits, _ = policy(x, h0_p)
+print("Policy logits shape:", logits.shape)  # 应为 (1, vocab_size)
+
+h0_v = value.init_hidden(1, device)
+v, _ = value(x, h0_v)
+print("Value estimate shape:", v.shape)  # 应为 (1,)
+
+
+# %% [markdown]
+# ### 6. 测试 RLAlphaGenerator._collect_trajectories
+
+# %%
+from generator import RLAlphaGenerator
+from alpha_generation_env import AlphaGenerationEnv
+from combination import AlphaCombinationModel
+from tokenizer import AlphaTokenizer
+from data import load_market_data
+from utility import set_random_seed
+
+# reload_components()
+
+set_random_seed(10)
+
+df = load_market_data()
+combo = AlphaCombinationModel()
+combo.inject_data(df, "target")
+tokenizer = AlphaTokenizer()
+env = AlphaGenerationEnv(combo, tokenizer, max_len=20)
+
+cfg = dict(
+    vocab_size=tokenizer.vocab_size,
+    hidden_dim=64,
+    batch_size=1280,
+    device="cpu",
+)
+
+agent = RLAlphaGenerator(env, cfg)
+
+s, a, logp, ret, adv = agent._collect_trajectories()
+print("Sample states shape:", s.shape)
+print("Sample actions shape:", a.shape)
+print("Sample rewards (returns):", ret.shape, ret)
+
+
+# %%
+
+
+================================================================================
+File: ./alpha_generation_env.py
+--------------------------------------------------------------------------------
+# alpha_generation_env.py
 from combination import AlphaCombinationModel
 from tokenizer import AlphaTokenizer
 from typing import List
@@ -147,45 +380,51 @@ class AlphaGenerationEnv:
         List[int]
             所有合法 token 的 ID 列表。
         """
-        valid: List[int] = []
         depth = len(self._stack_types)
         remaining = self.max_len - len(self.sequence)
 
+        if remaining == 1:
+            return [self.tokenizer.sep_token_id] if depth == 1 else []
+
+        valid = []
+        
+        if depth == 1:
+            valid.append(self.tokenizer.sep_token_id)
+
         for tok_id, tok in self.tokenizer.id_to_token.items():
-            if tok in ("[PAD]", "[BOS]"):
+            if tok in ("[PAD]", "[BOS]", "[SEP]"):
                 continue
 
-            if tok == "[SEP]":
-                if depth == 1:
-                    valid.append(tok_id)
-                continue
+            # 时间序列算子前，只有整型常量才合法
+            if tok in FUNC_MAP and tok.startswith("ts_"):
+                last_tok = self.tokenizer.id_to_token[self.sequence[-1]]
+                last_type = self.tokenizer.operand_type_map.get(last_tok)
+                if last_type != "Scalar_INT":
+                    continue
+                if last_tok == "CONST_1":
+                    continue
+                if tok == "ts_kurt" and last_tok == "CONST_3":
+                    continue
 
             if tok in FUNC_MAP:
-                _, arity, param_types = FUNC_MAP[tok]
-
-                if tok.startswith("ts_"):
-                    last_tok = self.tokenizer.id_to_token[self.sequence[-1]]
-                    if last_tok == "CONST_1":
-                        continue
-
+                fn, arity, param_types = FUNC_MAP[tok]
                 if depth < arity:
                     continue
-                types_given = self._stack_types[-arity:]
                 if not all(
-                    _type_compatible(g, r) for g, r in zip(types_given, param_types)
+                    _type_compatible(g, r)
+                    for g, r in zip(self._stack_types[-arity:], param_types)
                 ):
                     continue
-                if depth - arity + 1 > remaining:
+                if depth - arity + 1 >= remaining:
                     continue
                 valid.append(tok_id)
             else:
-                if (
-                    depth > 0
-                    and self.tokenizer.operand_type_map[tok].startswith("Scalar")
-                    and self._stack_types[-1].startswith("Scalar")
-                ):
+                # 常量不能连着常量
+                if depth > 0 \
+                and self.tokenizer.operand_type_map[tok].startswith("Scalar") \
+                and self._stack_types[-1].startswith("Scalar"):
                     continue
-                if depth + 1 <= remaining:
+                if depth + 1 < remaining:
                     valid.append(tok_id)
         return valid
 
@@ -201,7 +440,114 @@ def _type_compatible(given: str, required: str) -> bool:
 
 
 ================================================================================
-File: .\combination.py
+File: ./utility.py
+--------------------------------------------------------------------------------
+# utility.py
+import numpy as np
+import pandas as pd
+import os
+import random
+import torch
+
+
+def zscore_normalize(alpha: np.ndarray) -> pd.Series:
+    """
+    对因子序列进行Z-score标准化。
+
+    该函数对输入数组进行去均值除以标准差处理，
+    并将结果限制为有限值，所有NaN或无穷值替换为0。
+
+    Args:
+        alpha (np.ndarray): 原始因子值数组，dtype可包含NaN。
+
+    Returns:
+        pd.Series: 标准化后的序列，长度与输入相同，无NaN。
+    """
+    a = np.asarray(alpha, dtype=np.float64)
+    mean = np.nanmean(a)
+    std = np.nanstd(a)
+    if std == 0 or np.isnan(std):
+        return pd.Series(np.zeros_like(a))
+    with np.errstate(invalid="ignore", divide="ignore"):
+        z = (a - mean) / std
+    z = np.nan_to_num(z, nan=0.0, posinf=0.0, neginf=0.0)
+    return pd.Series(z)
+
+
+def winsorize(
+    alpha: np.ndarray, lower_quantile: float = 0.01, upper_quantile: float = 0.99
+) -> pd.Series:
+    """
+    对因子序列进行截尾处理，限制极端值。
+
+    使用指定上下分位数计算阈值，并将超出范围的值裁剪到边界，
+    所有NaN或无穷值替换为对应边界值。
+
+    Args:
+        alpha (np.ndarray): 原始因子值数组。
+        lower_quantile (float): 下分位点，默认0.01。
+        upper_quantile (float): 上分位点，默认0.99。
+
+    Returns:
+        pd.Series: 截尾后的序列，长度与输入相同，无NaN。
+    """
+    a = np.asarray(alpha, dtype=float)
+    with np.errstate(invalid="ignore", over="ignore"):
+        lower = np.nanpercentile(a, lower_quantile * 100)
+        upper = np.nanpercentile(a, upper_quantile * 100)
+        clipped = np.clip(a, lower, upper)
+    clipped = np.nan_to_num(clipped, nan=lower, posinf=upper, neginf=lower)
+    return pd.Series(clipped)
+
+
+def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
+    """
+    计算因子与目标的Pearson相关系数（信息系数）。
+
+    若输入长度不匹配或有效样本少于2，返回0；
+    若任意方差为0，返回0。
+
+    Args:
+        factor (np.ndarray): 因子值数组。
+        target (np.ndarray): 目标值数组（未来收益）。
+
+    Returns:
+        float: Pearson相关系数，范围[-1,1]，或0表示无效。
+    """
+    if len(factor) != len(target):
+        raise ValueError("Factor and target length mismatch")
+    mask = np.isfinite(factor) & np.isfinite(target)
+    if mask.sum() < 2:
+        return 0.0
+    f, t = factor[mask], target[mask]
+    if np.std(f) == 0 or np.std(t) == 0:
+        return 0.0
+    return float(np.corrcoef(f, t)[0, 1])
+
+
+def set_random_seed(seed: int = 42):
+    """
+    固定全局随机数种子，确保实验可复现。
+
+    Args:
+        seed (int): 随机数种子，默认42。
+    """
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+================================================================================
+File: ./__init__.py
+--------------------------------------------------------------------------------
+
+
+================================================================================
+File: ./combination.py
 --------------------------------------------------------------------------------
 # combination.py
 import numpy as np
@@ -344,23 +690,21 @@ class AlphaCombinationModel:
     def evaluate_alpha(self, expr: str) -> float:
         """
         直接根据 RPN 表达式计算并返回单因子 IC（带缓存）。
-
-        Args:
-            expr (str): RPN 表达式字符串。
-
-        Returns:
-            float: 该表达式生成因子的 Pearson IC。
-
-        Raises:
-            ValueError: 当表达式解析或运算失败时。
+        如果中间任何一步产生了 warning，在缓存完 IC 之后统一抛错。
         """
         new_alpha = self._compute_alpha_from_expr(expr)
-        print(expr)
+        new_alpha = np.nan_to_num(new_alpha, nan=0.0)
         norm = self._maybe_normalize(new_alpha)
+
+        if np.all(np.isnan(new_alpha)):
+            return -1.0
+
         key = ('expr_ic', expr)
         if key not in self._cache:
             target = self._load_validation_target()
-            self._cache[key] = information_coefficient(norm, target)
+            ic = information_coefficient(norm, target)
+            self._cache[key] = ic
+
         return self._cache[key]
 
     def score(self) -> float:
@@ -475,68 +819,244 @@ def _is_float(str) -> bool:
         return False
 
 ================================================================================
-File: .\data.py
+File: ./tokenizer.py
 --------------------------------------------------------------------------------
-# data.py 
+# tokenizer.py
+import operators
+from typing import List, Dict
 
-import pandas as pd
-import numpy as np
-
-
-def load_market_data(path: str = "data/rb_20250606_primary.csv", multiplier: int = 10, n: int = 5):
+class AlphaTokenizer:
     """
-    读取并预处理原始 A 股行情数据。
+    将逆波兰表达式 (RPN) 与 token 序列相互映射的分词器。
 
-    参数
-    ----------
-    path : str, 可选
-        CSV 文件的本地路径，默认为 ``"data/rb_20250606_primary.csv"``。
-    multiplier: int
-    n: int 可选
-        预测 n 秒之后的收益率
-
-    返回
-    ----------
-    pandas.DataFrame
-        处理后的行情特征表，包含基础字段以及 ``target``（20 日远期收益）列。
+    - **词表**：基础行情字段、常量桶、所有算子以及四则运算符  
+    - **特殊标记**：`[PAD]` 填充、`[BOS]` 序列起始、`[SEP]` 序列终止
     """
-    # TODO: 这里暂时读取本地文件
+    def __init__(self, base_fields: List[str] = None, const_buckets: List[float] = None):
+        """
+        构造分词器并自动扫描 `operators.py` 生成完整词表。
 
-    df = pd.read_csv(path, parse_dates=["timestamp"], index_col="timestamp")
+        参数
+        ----------
+        base_fields : list[str], 可选
+            基础行情字段名称列表，默认为  
+            ``['open', 'high', 'low', 'close', 'volume']``。
+        const_buckets : list[float], 可选
+            预定义浮点常量桶，默认为  
+            ``[1, 3, 5, 10, 20, 0.1, 0.5]``。
+        """
+        if base_fields is None:
+            base_fields = ['open', 'high', 'low', 'close', 'volume']
+        if const_buckets is None:
+            const_buckets = [1, 3, 5, 10, 20, 0.1, 0.5]
 
-    df = df.sort_index()
+        self.base_fields = base_fields
+        self.const_buckets = const_buckets
 
-    df['d_vol'] = df['volume'].diff()
-    df['d_amt'] = df['amount'].diff()
-    df['d_oi']  = df['openInterest'].diff()
+        self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
+        field_tokens = base_fields
+        const_tokens = [f'CONST_{c}' for c in const_buckets]
+        op_tokens: List = list(operators.FUNC_MAP.keys())
+        
+        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens
 
-    df.loc[df['d_vol'] <= 0, ['d_vol', 'd_amt']] = np.nan
+        self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
+        self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
+        self.operand_type_map: dict[str, str] = {}
 
-    df['trade_price'] = df['d_amt'] / df['d_vol'] / multiplier
+        for f in self.base_fields:
+            self.operand_type_map[f] = "Series"
+        for c in self.const_buckets:
+            tok = f"CONST_{c}"
+            # 先把 c 转成 float，再看是不是整数
+            if float(c).is_integer():
+                self.operand_type_map[tok] = "Scalar_INT"
+            else:
+                self.operand_type_map[tok] = "Scalar_FLOAT"
 
-    one_sec = df.resample('1s')
+        self.pad_token_id = self.token_to_id['[PAD]']
+        self.bos_token_id = self.token_to_id['[BOS]']
+        self.sep_token_id = self.token_to_id['[SEP]']
 
-    ohlc = pd.DataFrame({
-        'open' : one_sec['last'].first(),
-        'high' : one_sec['trade_price'].max(),
-        'low'  : one_sec['trade_price'].min(),
-        'close': one_sec['last'].last(),
-        'volume': one_sec['d_vol'].sum(),        # 可选：这一秒真正的成交量
-        'amount': one_sec['d_amt'].sum(),
-        'openInterest': one_sec['d_oi'].sum(),
-    })
+    @property
+    def vocab_size(self) -> int:
+        """
+        返回当前词表大小。
 
-    mask = ohlc['high'].isna()
-    ohlc.loc[mask, 'high'] = one_sec['last'].max()[mask]
-    ohlc.loc[mask, 'low']  = one_sec['last'].min()[mask]
+        返回
+        ----------
+        int
+            ``len(self.vocab)``。
+        """
+        return len(self.vocab)
 
-    ohlc['target'] = ohlc['close'].pct_change(periods=-n, fill_method=None)
-    return ohlc
+    def encode(self, expr: str, add_special_tokens: bool = True) -> List[int]:
+        """
+        将 RPN 字符串编码为 token ID 序列。
+
+        参数
+        ----------
+        expr : str
+            形如 ``"close 5 ts_mean"`` 的逆波兰表达式。
+        add_special_tokens : bool, 可选
+            是否在首尾分别加入 `[BOS]` 与 `[SEP]`，默认为 ``True``。
+
+        返回
+        ----------
+        list[int]
+            token ID 序列。
+        """
+        tokens = expr.strip().split()
+        ids = []
+        for tk in tokens:
+            # 基础字段
+            if tk in self.token_to_id:
+                ids.append(self.token_to_id[tk])
+            # 常量：动态加入最近的 bucket
+            elif self._is_float(tk):
+                val = float(tk)
+                const_tok = self._map_to_const(val)
+                ids.append(self.token_to_id[const_tok])
+            else:
+                raise ValueError(f"未知 token：{tk}")
+
+        if add_special_tokens:
+            ids = [self.bos_token_id] + ids + [self.sep_token_id]
+        return ids
+
+    def decode(self, ids: List[int], remove_special_tokens: bool = True) -> str:
+        """
+        将 token ID 序列还原为 RPN 字符串。
+
+        参数
+        ----------
+        ids : list[int]
+            编码后的 token ID 列表。
+        remove_special_tokens : bool, 可选
+            是否去除 `[BOS]` / `[SEP]` / `[PAD]`，默认为 ``True``。
+
+        返回
+        ----------
+        str
+            逆波兰表达式，常量会被还原为原始数字字符串。
+        """
+        toks = []
+        for idx in ids:
+            if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
+                continue
+            toks.append(self.id_to_token.get(idx, 'UNK'))
+        toks = [self._const_to_str(tk) for tk in toks]
+        return " ".join(toks)
+
+    def _map_to_const(self, val: float) -> str:
+        """
+        将任意浮点数映射到最近的常量桶，并返回其 token 名。
+
+        参数
+        ----------
+        val : float
+            原始浮点数。
+
+        返回
+        ----------
+        str
+            形如 ``"CONST_5"`` 的 token 名称。
+        """
+        closest = min(self.const_buckets, key=lambda x: abs(x - val))
+        return f'CONST_{closest}'
+
+    def _const_to_str(self, token: str) -> str:
+        """
+        将常量 token 名恢复为数字字符串。
+
+        参数
+        ----------
+        token : str
+            形如 ``"CONST_3"`` 的 token。
+
+        返回
+        ----------
+        str
+            ``"3"``；如果传入非常量 token，则原样返回。
+        """
+        if token.startswith('CONST_'):
+            return token.split('_', 1)[1]
+        return token
+
+    def rpn_to_infix(self, rpn: str) -> str:
+        """
+        将逆波兰表达式 (RPN) 转换为可读的中缀表达式。
+
+        参数
+        ----------
+        rpn : str
+            形如 `"close 5 ts_mean high low sub mul"` 的 RPN 式字符串。
+
+        返回
+        ----------
+        str
+            对应的中缀表达式字符串，例如 `"(ts_mean(close, 5) * (high - low))"`。
+        """
+        from operators import FUNC_MAP
+
+        stack: List[str] = []
+        tokens = rpn.strip().split()
+        for tk in tokens:
+            # 操作符
+            if tk in FUNC_MAP:
+                fn, arity, _ = FUNC_MAP[tk]
+                if arity == 1:
+                    a = stack.pop()
+                    stack.append(f"{tk}({a})")
+                elif arity == 2:
+                    b = stack.pop()
+                    a = stack.pop()
+                    if tk == "add":
+                        stack.append(f"({a} + {b})")
+                    elif tk == "sub":
+                        stack.append(f"({a} - {b})")
+                    elif tk == "mul":
+                        stack.append(f"({a} * {b})")
+                    elif tk == "div":
+                        stack.append(f"({a} / {b})")
+                    else:
+                        stack.append(f"{tk}({a}, {b})")
+                else:
+                    args = ", ".join(stack[-arity:])
+                    stack = stack[:-arity]
+                    stack.append(f"{tk}({args})")
+            else:
+                val = self._const_to_str(tk)
+                stack.append(val)
+        return stack[0] if stack else ""
+
+    @staticmethod
+    def _is_float(s: str) -> bool:
+        """
+        判断字符串能否安全转换为 `float`。
+
+        参数
+        ----------
+        s : str
+            待检测字符串。
+
+        返回
+        ----------
+        bool
+            可转换返回 ``True``，否则 ``False``。
+        """
+        try:
+            float(s)
+            return True
+        except ValueError:
+            return False
+
 
 
 ================================================================================
-File: .\generator.py
+File: ./generator.py
 --------------------------------------------------------------------------------
+# generator.py
 from typing import List, Tuple, Dict, Any
 import torch
 import torch.nn as nn
@@ -785,9 +1305,10 @@ class RLAlphaGenerator:
                 logp = dist.log_prob(action)
 
                 value, h_v = self.value_net(obs, h_v)
-
+                value = value.squeeze(0).detach()
+            
                 next_obs, reward, done, _ = self.env.step(action.item())
-
+            
             pad_id = self.env.tokenizer.pad_token_id
             raw = obs.squeeze(0)  # 长度不定
             pad = torch.full((self.max_seq_len,), pad_id, dtype=torch.long, device=self.device)
@@ -801,7 +1322,7 @@ class RLAlphaGenerator:
             logps.append(logp)
             rewards.append(torch.tensor(reward, device=self.device, dtype=torch.float32))
             dones.append(done)
-            values.append(value.squeeze(0))
+            values.append(value)
 
             if done:
                 obs = torch.tensor([self.env.reset()], device=self.device)
@@ -827,8 +1348,85 @@ class RLAlphaGenerator:
     
 
 ================================================================================
-File: .\operators.py
+File: ./paradigm.py
 --------------------------------------------------------------------------------
+import numpy as np
+
+# alpha_mining_framework/
+# ├── __init__.py
+# ├── data.py            # Data loading & preprocessing
+# ├── utils.py           # Metrics: IC, RankIC, normalization, caching
+# ├── combination.py     # AlphaCombinationModel: linear combine + weight optimization
+# ├── env.py             # AlphaGenerationEnv: custom RL environment without gym
+# ├── generator.py       # RLAlphaGenerator: PPO policy & value networks
+# ├── train.py           # Main training loop implementing Algorithm 2
+# └── run_backtest.py    # Backtesting & investment simulation (Figure 5)
+
+
+
+
+
+
+================================================================================
+File: ./train.py
+--------------------------------------------------------------------------------
+# train.py
+import os
+import yaml
+import pandas as pd
+
+from utility import set_random_seed
+from data import load_market_data
+from combination import AlphaCombinationModel
+from tokenizer import AlphaTokenizer
+from alpha_generation_env import AlphaGenerationEnv
+from generator import RLAlphaGenerator
+
+
+def main(config_path: str = "config.yaml"):
+    with open(config_path, "r") as f:
+        cfg = yaml.safe_load(f)
+
+    set_random_seed(cfg.get("random_seed", 42))
+
+    data_cfg = cfg["data"]
+    df = load_market_data(
+        path=data_cfg["path"], multiplier=data_cfg["multiplier"], n=data_cfg["n"]
+    )
+
+    combo = AlphaCombinationModel(max_pool_size=cfg["model"]["max_pool_size"])
+    combo.inject_data(df, target_col=data_cfg["target_col"])
+
+    tokenizer = AlphaTokenizer()
+    env = AlphaGenerationEnv(
+        combo_model=combo, tokenizer=tokenizer, max_len=cfg["env"]["max_len"]
+    )
+
+    gen_cfg = cfg["generator"]
+    gen_cfg["vocab_size"] = tokenizer.vocab_size
+    gen_cfg["max_seq_len"] = cfg["env"]["max_len"]
+    agent = RLAlphaGenerator(env=env, config=gen_cfg)
+
+    print(f"Starting training for {gen_cfg['num_iterations']} iterations...")
+    agent.train(num_iterations=gen_cfg["num_iterations"])
+
+    out_cfg = cfg["output"]
+    os.makedirs(os.path.dirname(out_cfg["alphas_weights_path"]), exist_ok=True)
+    results = pd.DataFrame(
+        {"expr": combo.expr_list, "ic": combo.ic_list, "weight": combo.weights}
+    )
+    results.to_csv(out_cfg["alphas_weights_path"], index=False)
+    print(f"Saved discovered alphas and weights to {out_cfg['alphas_weights_path']}")
+
+
+if __name__ == "__main__":
+    main()
+
+
+================================================================================
+File: ./operators.py
+--------------------------------------------------------------------------------
+# operators.py
 import pandas as pd
 import numpy as np
 import inspect
@@ -852,7 +1450,6 @@ def mul(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
     return x * y
 
 def div(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
-    # 避免除以0（支持 Series 和标量）
     if isinstance(y, pd.Series):
         y = y.replace(0, np.nan)
     elif y == 0:
@@ -869,11 +1466,13 @@ def abs_(x: pd.Series) -> pd.Series:
 def sign(x: pd.Series) -> pd.Series:
     return np.sign(x)
 
-def log(x: pd.Series) -> pd.Series:
-    return np.log(x.replace(0, np.nan))  # 避免 log(0)
+def signed_log(x: pd.Series) -> pd.Series:
+    a = x.abs().replace(0, np.nan)
+    lg = np.log(a)
+    return np.sign(x) * lg
 
-def sqrt(x: pd.Series) -> pd.Series:
-    return np.sqrt(x)
+def signed_sqrt(x: pd.Series) -> pd.Series:
+    return np.sign(x) * np.sqrt(x.abs())
 
 def neg(x: pd.Series) -> pd.Series:
     return -x
@@ -976,7 +1575,7 @@ def ts_zscore(series: pd.Series, window: int) -> pd.Series:
 
 def ts_return(series: pd.Series, window: int = 1) -> pd.Series:
     """周期收益率"""
-    return series.pct_change(window)
+    return series.pct_change(window, fill_method=None)
 
 
 FUNC_MAP: dict[str, tuple[callable, int, List[str]]] = {}
@@ -1004,307 +1603,99 @@ for name, fn in inspect.getmembers(__import__(__name__), inspect.isfunction):
 
 
 ================================================================================
-File: .\paradigm.py
+File: ./data.py
 --------------------------------------------------------------------------------
-import numpy as np
-
-# alpha_mining_framework/
-# ├── __init__.py
-# ├── data.py            # Data loading & preprocessing
-# ├── utils.py           # Metrics: IC, RankIC, normalization, caching
-# ├── combination.py     # AlphaCombinationModel: linear combine + weight optimization
-# ├── env.py             # AlphaGenerationEnv: custom RL environment without gym
-# ├── generator.py       # RLAlphaGenerator: PPO policy & value networks
-# ├── train.py           # Main training loop implementing Algorithm 2
-# └── run_backtest.py    # Backtesting & investment simulation (Figure 5)
+# data.py
+# TODO: 逻辑需要更加细化，
+# 1. 过滤不合格的交易时间--针对不同的交易品种 
+# 2. 怎么样弹性地满足不同跨度因子的需求，整理成 numpy.array 高效地计算 ic，现在处理方式为 直接concat，很不合理
+#   a. 不同的时间窗口; 
+#   b. 不同的 symbol;
 
 
-
-
-
-
-================================================================================
-File: .\tokenizer.py
---------------------------------------------------------------------------------
-# tokenizer.py
-import operators
 from typing import List, Dict
-
-class AlphaTokenizer:
-    """
-    将逆波兰表达式 (RPN) 与 token 序列相互映射的分词器。
-
-    - **词表**：基础行情字段、常量桶、所有算子以及四则运算符  
-    - **特殊标记**：`[PAD]` 填充、`[BOS]` 序列起始、`[SEP]` 序列终止
-    """
-    def __init__(self, base_fields: List[str] = None, const_buckets: List[float] = None):
-        """
-        构造分词器并自动扫描 `operators.py` 生成完整词表。
-
-        参数
-        ----------
-        base_fields : list[str], 可选
-            基础行情字段名称列表，默认为  
-            ``['open', 'high', 'low', 'close', 'volume']``。
-        const_buckets : list[float], 可选
-            预定义浮点常量桶，默认为  
-            ``[1, 3, 5, 10, 20, 0.1, 0.5]``。
-        """
-        if base_fields is None:
-            base_fields = ['open', 'high', 'low', 'close', 'volume']
-        if const_buckets is None:
-            const_buckets = [1, 3, 5, 10, 20, 0.1, 0.5]
-
-        self.base_fields = base_fields
-        self.const_buckets = const_buckets
-
-        self.special_tokens = ['[PAD]', '[BOS]', '[SEP]']
-        field_tokens = base_fields
-        const_tokens = [f'CONST_{c}' for c in const_buckets]
-        op_tokens: List = list(operators.FUNC_MAP.keys())
-        
-        self.vocab: List[str] = self.special_tokens + field_tokens + const_tokens + op_tokens
-
-        self.token_to_id: Dict[str, int] = {tok: idx for idx, tok in enumerate(self.vocab)}
-        self.id_to_token: Dict[int, str] = {idx: tok for tok, idx in self.token_to_id.items()}
-        self.operand_type_map: dict[str, str] = {}
-
-        for f in self.base_fields:
-            self.operand_type_map[f] = "Series"
-        for c in self.const_buckets:
-            tok = f"CONST_{c}"
-            # 先把 c 转成 float，再看是不是整数
-            if float(c).is_integer():
-                self.operand_type_map[tok] = "Scalar_INT"
-            else:
-                self.operand_type_map[tok] = "Scalar_FLOAT"
-
-        self.pad_token_id = self.token_to_id['[PAD]']
-        self.bos_token_id = self.token_to_id['[BOS]']
-        self.sep_token_id = self.token_to_id['[SEP]']
-
-    @property
-    def vocab_size(self) -> int:
-        """
-        返回当前词表大小。
-
-        返回
-        ----------
-        int
-            ``len(self.vocab)``。
-        """
-        return len(self.vocab)
-
-    def encode(self, expr: str, add_special_tokens: bool = True) -> List[int]:
-        """
-        将 RPN 字符串编码为 token ID 序列。
-
-        参数
-        ----------
-        expr : str
-            形如 ``"close 5 ts_mean"`` 的逆波兰表达式。
-        add_special_tokens : bool, 可选
-            是否在首尾分别加入 `[BOS]` 与 `[SEP]`，默认为 ``True``。
-
-        返回
-        ----------
-        list[int]
-            token ID 序列。
-        """
-        tokens = expr.strip().split()
-        ids = []
-        for tk in tokens:
-            # 基础字段
-            if tk in self.token_to_id:
-                ids.append(self.token_to_id[tk])
-            # 常量：动态加入最近的 bucket
-            elif self._is_float(tk):
-                val = float(tk)
-                const_tok = self._map_to_const(val)
-                ids.append(self.token_to_id[const_tok])
-            else:
-                raise ValueError(f"未知 token：{tk}")
-
-        if add_special_tokens:
-            ids = [self.bos_token_id] + ids + [self.sep_token_id]
-        return ids
-
-    def decode(self, ids: List[int], remove_special_tokens: bool = True) -> str:
-        """
-        将 token ID 序列还原为 RPN 字符串。
-
-        参数
-        ----------
-        ids : list[int]
-            编码后的 token ID 列表。
-        remove_special_tokens : bool, 可选
-            是否去除 `[BOS]` / `[SEP]` / `[PAD]`，默认为 ``True``。
-
-        返回
-        ----------
-        str
-            逆波兰表达式，常量会被还原为原始数字字符串。
-        """
-        toks = []
-        for idx in ids:
-            if remove_special_tokens and idx in [self.bos_token_id, self.sep_token_id, self.pad_token_id]:
-                continue
-            toks.append(self.id_to_token.get(idx, 'UNK'))
-        # 常量还原
-        toks = [self._const_to_str(tk) for tk in toks]
-        return " ".join(toks)
-
-    def _map_to_const(self, val: float) -> str:
-        """
-        将任意浮点数映射到最近的常量桶，并返回其 token 名。
-
-        参数
-        ----------
-        val : float
-            原始浮点数。
-
-        返回
-        ----------
-        str
-            形如 ``"CONST_5"`` 的 token 名称。
-        """
-        closest = min(self.const_buckets, key=lambda x: abs(x - val))
-        return f'CONST_{closest}'
-
-    def _const_to_str(self, token: str) -> str:
-        """
-        将常量 token 名恢复为数字字符串。
-
-        参数
-        ----------
-        token : str
-            形如 ``"CONST_3"`` 的 token。
-
-        返回
-        ----------
-        str
-            ``"3"``；如果传入非常量 token，则原样返回。
-        """
-        if token.startswith('CONST_'):
-            return token.split('_', 1)[1]
-        return token
-
-    @staticmethod
-    def _is_float(s: str) -> bool:
-        """
-        判断字符串能否安全转换为 `float`。
-
-        参数
-        ----------
-        s : str
-            待检测字符串。
-
-        返回
-        ----------
-        bool
-            可转换返回 ``True``，否则 ``False``。
-        """
-        try:
-            float(s)
-            return True
-        except ValueError:
-            return False
-
-
-
-================================================================================
-File: .\train.py
---------------------------------------------------------------------------------
-# train.py
-from combination import AlphaCombinationModel
-from envs import AlphaGenerationEnv
-from generator import RLAlphaGenerator
-
-if __name__ == "__main__":
-    # 1. Load data
-    # 2. Initialize AlphaCombinationModel
-    # 3. Initialize tokenizer 和 AlphaGenerationEnv
-    # 4. Initialize RLAlphaGenerator
-    # 5. 调用 generator.train()
-    # 6. 保存发现的 alphas 和权重
-    pass
-
-
-================================================================================
-File: .\utility.py
---------------------------------------------------------------------------------
-# utility.py
-
-import numpy as np
+from datetime import datetime
+from pathlib import Path
 import pandas as pd
-import os
-import random
-import torch
+import numpy as np
+from joblib import Parallel, delayed
+
+def load_and_process(file: Path, multiplier: int, n: int) -> pd.DataFrame:
+    df = pd.read_parquet(file)
+    return process_tick_data(df, multiplier=multiplier, n=n)
+
+def load_symbol_dfs(
+    directory: str,
+    symbols: Dict[str, int],
+    start_date: str,
+    end_date: str,
+    n_jobs: int = 4,
+    n: int = 10
+) -> Dict[str, List[pd.DataFrame]]:
+    dir_path = Path(directory)
+    dt_start = datetime.strptime(start_date, "%Y%m%d").date()
+    dt_end   = datetime.strptime(end_date,   "%Y%m%d").date()
+
+    symbol_dfs: Dict[str, List[pd.DataFrame]] = {}
+
+    for sym, mul in symbols.items():
+        files = []
+        for file in dir_path.glob(f"{sym}_*.parquet"):
+            date_str = file.stem.split("_", 1)[1]
+            try:
+                file_date = datetime.strptime(date_str, "%Y%m%d").date()
+            except ValueError:
+                continue
+            if dt_start <= file_date <= dt_end:
+                files.append(file)
+        files = sorted(files)
+
+        processed_list = Parallel(n_jobs=n_jobs, backend="loky")(
+            delayed(load_and_process)(file, mul, n)
+            for file in files
+        )
+        symbol_dfs[sym] = processed_list
+
+    return symbol_dfs
+
+def process_tick_data(df: pd.DataFrame, multiplier: int = 10, n: int = 5):
+
+    df = df.copy()
+    df = df.set_index("timestamp").sort_index()
+
+    df["d_vol"] = df["volume"].diff()
+    df["d_amt"] = df["amount"].diff()
+    df["d_oi"] = df["openInterest"].diff()
+
+    df.loc[df["d_vol"] <= 0, ["d_vol", "d_amt"]] = np.nan
+
+    df["trade_price"] = df["d_amt"] / df["d_vol"] / multiplier
+
+    df['ts_ceil'] = df.index.to_series().dt.ceil('s')
+
+    group = df.groupby('ts_ceil', sort=True)
+    ohlc = pd.DataFrame({
+        'open':         group['last'].first(),
+        'high':         group['trade_price'].max(),
+        'low':          group['trade_price'].min(),
+        'close':        group['last'].last(),
+        'volume':       group['d_vol'].sum(),
+        'amount':       group['d_amt'].sum(),
+        'openInterest': group['d_oi'].sum(),
+    })
+
+    ohlc.index.name = 'timestamp'
+
+    mask = ohlc['high'].isna()
+    if mask.any():
+        last_max = group['last'].max()
+        last_min = group['last'].min()
+        ohlc.loc[mask, 'high'] = last_max[mask]
+        ohlc.loc[mask, 'low']  = last_min[mask]
+
+    ohlc["target"] = ohlc["close"].pct_change(periods=-n, fill_method=None)
+    return ohlc
 
 
-def zscore_normalize(alpha: np.ndarray) -> pd.Series:
-    """
-    Z-score 标准化处理：消除因子的尺度影响
-    """
-    a = np.asarray(alpha, dtype=np.float64)
-    mean = np.nanmean(a)
-    std = np.nanstd(a)
-    if std == 0 or np.isnan(std):
-        return pd.Series(np.zeros_like(a))
-    return pd.Series((a - mean) / std)
-
-def winsorize(alpha: np.ndarray, lower_quantile: float = 0.01, upper_quantile: float = 0.99) -> pd.Series:
-    """
-    异常值截断处理：防止 outlier 扰动因子稳定性
-    """
-    a = np.asarray(alpha, dtype=float)
-    lower = np.nanpercentile(a, lower_quantile * 100)
-    upper = np.nanpercentile(a, upper_quantile * 100)
-    clipped = np.clip(a, lower, upper)
-    return pd.Series(clipped)
-
-def information_coefficient(factor: np.ndarray, target: np.ndarray) -> float:
-    """
-    信息系数（IC）：衡量因子预测未来收益的能力，Pearson 相关系数
-    """
-    if len(factor) != len(target):
-        raise ValueError("Factor and target length mismatch")
-    
-    mask = np.isfinite(factor) & np.isfinite(target)
-    if mask.sum() < 2:               # 样本太少无法算相关
-        return 0.0
-    
-    f, t = factor[mask], target[mask]
-
-    if np.std(f) == 0 or np.std(t) == 0:
-        return 0.0
-
-    return float(np.corrcoef(f, t)[0, 1])
-
-def set_random_seed(SEED: int = 42):
-    """
-    固定全局随机数种子，确保实验可复现。
-    参数：
-        seed (int): 随机数种子，默认 42。
-    """
-    # 1. 系统级别
-    os.environ["PYTHONHASHSEED"] = str(SEED)
-
-    # 2. Python 自带的 random
-    random.seed(SEED)
-
-    # 3. NumPy
-    np.random.seed(SEED)
-
-    # 4. PyTorch
-    torch.manual_seed(SEED)
-    torch.cuda.manual_seed_all(SEED)
-    # 以下两行可保证 cuDNN 的确定性（可能会略微牺牲一点速度）
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-================================================================================
-File: .\__init__.py
---------------------------------------------------------------------------------
 
 

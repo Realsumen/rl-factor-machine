@@ -1,4 +1,4 @@
-# env.py
+# alpha_generation_env.py
 from combination import AlphaCombinationModel
 from tokenizer import AlphaTokenizer
 from typing import List
@@ -106,7 +106,7 @@ class AlphaGenerationEnv:
         if action == self.tokenizer.sep_token_id or len(self.sequence) >= self.max_len:
             expr = self.tokenizer.decode(self.sequence, remove_special_tokens=True)
             try:
-                reward = self.combo_model.evaluate_alpha(expr)
+                reward = self.combo_model.add_alpha_expr(expr)
             except ValueError as e:
                 reward = -1.0
                 info["error"] = str(e)
@@ -144,45 +144,51 @@ class AlphaGenerationEnv:
         List[int]
             所有合法 token 的 ID 列表。
         """
-        valid: List[int] = []
         depth = len(self._stack_types)
         remaining = self.max_len - len(self.sequence)
 
+        if remaining == 1:
+            return [self.tokenizer.sep_token_id] if depth == 1 else []
+
+        valid = []
+        
+        if depth == 1:
+            valid.append(self.tokenizer.sep_token_id)
+
         for tok_id, tok in self.tokenizer.id_to_token.items():
-            if tok in ("[PAD]", "[BOS]"):
+            if tok in ("[PAD]", "[BOS]", "[SEP]"):
                 continue
 
-            if tok == "[SEP]":
-                if depth == 1:
-                    valid.append(tok_id)
-                continue
+            # 时间序列算子前，只有整型常量才合法
+            if tok in FUNC_MAP and tok.startswith("ts_"):
+                last_tok = self.tokenizer.id_to_token[self.sequence[-1]]
+                last_type = self.tokenizer.operand_type_map.get(last_tok)
+                if last_type != "Scalar_INT":
+                    continue
+                if last_tok == "CONST_1":
+                    continue
+                if tok == "ts_kurt" and last_tok == "CONST_3":
+                    continue
 
             if tok in FUNC_MAP:
-                _, arity, param_types = FUNC_MAP[tok]
-
-                if tok.startswith("ts_"):
-                    last_tok = self.tokenizer.id_to_token[self.sequence[-1]]
-                    if last_tok == "CONST_1":
-                        continue
-
+                fn, arity, param_types = FUNC_MAP[tok]
                 if depth < arity:
                     continue
-                types_given = self._stack_types[-arity:]
                 if not all(
-                    _type_compatible(g, r) for g, r in zip(types_given, param_types)
+                    _type_compatible(g, r)
+                    for g, r in zip(self._stack_types[-arity:], param_types)
                 ):
                     continue
-                if depth - arity + 1 > remaining:
+                if depth - arity + 1 >= remaining:
                     continue
                 valid.append(tok_id)
             else:
-                if (
-                    depth > 0
-                    and self.tokenizer.operand_type_map[tok].startswith("Scalar")
-                    and self._stack_types[-1].startswith("Scalar")
-                ):
+                # 常量不能连着常量
+                if depth > 0 \
+                and self.tokenizer.operand_type_map[tok].startswith("Scalar") \
+                and self._stack_types[-1].startswith("Scalar"):
                     continue
-                if depth + 1 <= remaining:
+                if depth + 1 < remaining:
                     valid.append(tok_id)
         return valid
 

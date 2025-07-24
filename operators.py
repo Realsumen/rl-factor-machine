@@ -1,3 +1,4 @@
+# operators.py
 import pandas as pd
 import numpy as np
 import inspect
@@ -21,7 +22,6 @@ def mul(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
     return x * y
 
 def div(x: ScalarOrSeries, y: ScalarOrSeries) -> ScalarOrSeries:
-    # 避免除以0（支持 Series 和标量）
     if isinstance(y, pd.Series):
         y = y.replace(0, np.nan)
     elif y == 0:
@@ -38,11 +38,13 @@ def abs_(x: pd.Series) -> pd.Series:
 def sign(x: pd.Series) -> pd.Series:
     return np.sign(x)
 
-def log(x: pd.Series) -> pd.Series:
-    return np.log(x.replace(0, np.nan))  # 避免 log(0)
+def signed_log(x: pd.Series) -> pd.Series:
+    a = x.abs().replace(0, np.nan)
+    lg = np.log(a)
+    return np.sign(x) * lg
 
-def sqrt(x: pd.Series) -> pd.Series:
-    return np.sqrt(x)
+def signed_sqrt(x: pd.Series) -> pd.Series:
+    return np.sign(x) * np.sqrt(x.abs())
 
 def neg(x: pd.Series) -> pd.Series:
     return -x
@@ -145,7 +147,7 @@ def ts_zscore(series: pd.Series, window: int) -> pd.Series:
 
 def ts_return(series: pd.Series, window: int = 1) -> pd.Series:
     """周期收益率"""
-    return series.pct_change(window)
+    return series.pct_change(window, fill_method=None)
 
 
 FUNC_MAP: dict[str, tuple[callable, int, List[str]]] = {}

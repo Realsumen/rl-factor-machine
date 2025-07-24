@@ -1,0 +1,37 @@
+# config.yaml
+
+data:
+  path: "data"                          # 原始行情数据目录
+  date_range:
+    - "20250601"
+    - "20250630"
+  symbol:
+    rb: 10                              # RB 合约手数：10 吨/手
+    sa: 10                              # SA 合约手数：10 吨/手
+    ta: 20                              # TA 合约手数：20 吨/手
+  n: 10                                 # 预测 n 秒后收益的窗口大小
+  target_col: "target"                  # 目标列名称
+
+model:
+  max_pool_size: 50                     # 因子池最大容量
+
+env:
+  max_len: 20                           # 生成序列的最大长度（含 [BOS] 与 [SEP]）
+
+generator:
+  hidden_dim: 128                       # LSTM 隐藏层维度
+  device: "cpu"                         # 训练设备
+  lr_policy: !!float 3e-4                       # 策略网络学习率
+  lr_value: !!float 1e-3                        # 价值网络学习率
+  gamma: 1.0                            # 折扣因子
+  clip_eps: 0.2                         # PPO 截断阈值
+  entropy_coef: 0.01                    # 熵正则系数
+  value_coef: 0.5                       # 价值损失系数
+  update_epochs: 4                      # 每轮更新的 epoch 数
+  batch_size: 512                       # 采样批量大小
+  num_iterations: 300                   # 总训练轮数
+
+random_seed: 42                         # 全局随机种子
+
+output:
+  alphas_weights_path: "output/alphas_weights.csv"
