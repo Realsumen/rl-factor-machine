@@ -1,6 +1,4 @@
 # tokenizer.py
-import re
-import inspect
 import operators
 from typing import List, Dict
 

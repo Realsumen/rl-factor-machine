@@ -5,7 +5,6 @@ from scipy.optimize import minimize
 from typing import List, Dict, Union, Tuple, Callable
 import operators
 import pandas as pd
-import inspect
 
 class AlphaCombinationModel:
     """

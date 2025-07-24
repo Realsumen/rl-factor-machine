@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torch.distributions import Categorical
-from envs import AlphaGenerationEnv
+from alpha_generation_env import AlphaGenerationEnv
 
 
 class PolicyNetwork(nn.Module):
