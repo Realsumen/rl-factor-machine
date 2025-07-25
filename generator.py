@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 from torch.distributions import Categorical
+from tqdm import tqdm
 from alpha_generation_env import AlphaGenerationEnv
 
 
@@ -106,6 +107,7 @@ class ValueNetwork(nn.Module):
 
 
 class RLAlphaGenerator:
+    # TODO: 多进程高效训练
     """
     使用 PPO 在 `AlphaGenerationEnv` 中训练策略网络，自动生成高 IC 的 Alpha 表达式。
     """
@@ -138,8 +140,9 @@ class RLAlphaGenerator:
         self.entropy_coef = config.get("entropy_coef", 0.01)
         self.value_coef = config.get("value_coef", 0.5)
         self.update_epochs = config.get("update_epochs", 4)
-        self.batch_size = config.get("batch_size", 64)
         self.max_seq_len = config.get("max_seq_len", 20)
+        self.rollout_size    = config.get("rollout_size", 4096)
+        self.mini_batch_size = config.get("mini_batch_size", 256)
     
     def train(self, num_iterations: int) -> None:
         """
@@ -152,13 +155,13 @@ class RLAlphaGenerator:
         for it in range(1, num_iterations + 1):
             # ------ 采样轨迹 -------------------------------------------------
             states, actions, old_logps, returns, advantages = self._collect_trajectories()
-
+            
             # Advantage 标准化以稳定训练
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
             # 打包成 DataLoader，方便多轮 epoch shuffle
             ds = TensorDataset(states, actions, old_logps, returns, advantages)
-            loader = DataLoader(ds, batch_size=self.batch_size, shuffle=True)
+            loader = DataLoader(ds, batch_size=self.mini_batch_size, shuffle=True)
 
             for _ in range(self.update_epochs):
                 for s, a, logp_old, ret, adv in loader:
@@ -199,7 +202,7 @@ class RLAlphaGenerator:
                     self.value_optimizer.step()
 
             # ------ 打印监控信息 --------------------------------------------
-            if it % 10 == 0:
+            if it % 1 == 0:
                 with torch.no_grad():
                     avg_ret = returns.mean().item()
                     combo_ic = self.env.combo_model.score()
@@ -231,7 +234,7 @@ class RLAlphaGenerator:
         obs = torch.tensor([self.env.reset()], device=self.device)
         h_p, h_v = self.policy_net.init_hidden(1, self.device), self.value_net.init_hidden(1, self.device)
 
-        while len(states) < self.batch_size:
+        for _ in range(self.rollout_size):
             logits, h_p = self.policy_net(obs, h_p)
 
             # -------- Invalid-action-mask --------

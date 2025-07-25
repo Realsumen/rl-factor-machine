@@ -1,10 +1,12 @@
 # combination.py
 import numpy as np
 from utility import zscore_normalize, winsorize, information_coefficient
+from sklearn.linear_model import ElasticNet
 from scipy.optimize import minimize
 from typing import List, Dict, Union, Tuple, Callable
 import operators
 import pandas as pd
+
 
 class AlphaCombinationModel:
     """
@@ -28,7 +30,14 @@ class AlphaCombinationModel:
         data (pd.DataFrame): 注入的行情数据。
         _target (np.ndarray): 注入的目标列（未来收益）数组。
     """
-    def __init__(self, max_pool_size: int = 50):
+
+    def __init__(
+        self,
+        max_pool_size: int = 50,
+        combiner: Union[str, Callable] = "lsqp",
+        combiner_args: Tuple = (),
+        combiner_kwargs: Dict = None,
+    ):
         """
         初始化 AlphaCombinationModel。
 
@@ -36,12 +45,16 @@ class AlphaCombinationModel:
             max_pool_size (int): 因子池的最大容量，上限内优先保留贡献度高的因子。
         """
         self.max_pool_size = max_pool_size
-        self.alphas = []         # 原始因子序列列表
-        self.norm_alphas = []    # 归一化后的因子序列列表
-        self.ic_list = []        # 对应的单因子 IC 值列表
-        self.weights = []        # 当前组合的线性权重列表
-        self._cache = {}         # 缓存字典，用于存储中间结果
-        self.expr_list = []      # 新增：对应每条因子的 RPN 表达式字符串
+        self.combiner = combiner
+        self.combiner_args = combiner_args
+        self.combiner_kwargs = combiner_kwargs or {}
+
+        self.alphas = []  # 原始因子序列列表
+        self.norm_alphas = []  # 归一化后的因子序列列表
+        self.ic_list = []  # 对应的单因子 IC 值列表
+        self.weights = []  # 当前组合的线性权重列表
+        self._cache = {}  # 缓存字典，用于存储中间结果
+        self.expr_list = []  # 新增：对应每条因子的 RPN 表达式字符串
 
     def inject_data(self, df: pd.DataFrame, target_col: str) -> None:
         """
@@ -76,53 +89,90 @@ class AlphaCombinationModel:
         return ic
 
     def _reoptimize_weights(self):
-        """
-        使用凸优化（SLSQP）在当前因子池上求解最优线性权重，
-        目标：最大化组合序列与目标的 Pearson 相关系数（IC），
-        约束：权重绝对值之和等于 1（L1 归一化）。
-        """
         A = np.vstack(self.norm_alphas).T
-        target = self._load_validation_target()
+        y = self._load_validation_target()
+
+        if isinstance(self.combiner, str):
+            if self.combiner == "lsqp":
+                w = self._reoptimize_weights_lsqp(
+                    A, y, *self.combiner_args, **self.combiner_kwargs
+                )
+            elif self.combiner == "elastic_net":
+                w = self._reoptimize_weights_enet(
+                    A, y, *self.combiner_args, **self.combiner_kwargs
+                )
+            else:
+                raise ValueError(f"Unknown combiner: {self.combiner}")
+        elif callable(self.combiner):
+            w = self.combiner(A, y, *self.combiner_args, **self.combiner_kwargs)
+        else:
+            raise TypeError("combiner 必须是 str 或者 可调用")
+
+        self.weights = np.asarray(w, dtype=float).ravel().tolist()
+        self._cache["weights"] = w.copy()
+
+    def _reoptimize_weights_lsqp(self, A, y, *args, **kwargs):
+        """原始 SLSQP + L1 约束"""
 
         def objective(w):
             combo = A.dot(w)
-            ic = np.corrcoef(combo, target)[0, 1]
+            ic = np.corrcoef(combo, y)[0, 1]
             return -np.nan_to_num(ic)
 
-        cons = ({'type': 'eq', 'fun': lambda w: np.sum(np.abs(w)) - 1})
+        cons = {"type": "eq", "fun": lambda w: np.sum(np.abs(w)) - 1}
         x0 = np.ones(A.shape[1]) / A.shape[1]
-        res = minimize(objective, x0, constraints=cons, method='SLSQP')
-        self.weights = res.x.tolist()
-        self._cache['weights'] = res.x.copy()
+        res = minimize(objective, x0, constraints=cons, method="SLSQP")
+        return res.x
+
+    def _reoptimize_weights_enet(self, A, y, *args, **kwargs):
+        """ElasticNet 拟合后再归一化 ∑|w|=1"""
+        import threading
+        print(f"[enet] 开始 fit by {threading.current_thread().name}")
+        model = ElasticNet(
+            fit_intercept=False,
+            random_state=42,
+            **kwargs,
+        )
+        model.fit(A, y)
+        print("  [enet] fit 完成", flush=True)
+        raise RuntimeError("ddd")
+        w = model.coef_
+        s = np.sum(np.abs(w))
+        print("  [enet] 返回 w=", w, flush=True)
+        return (w / s) if s > 0 else w
 
     def evaluate_alpha(self, expr: str) -> float:
         """只评估 IC，不入池。"""
         _, _, ic = self._compute_alpha_and_ic(expr)
         return ic
 
-    def _compute_alpha_and_ic(self, expr: str) -> Tuple[np.ndarray, np.ndarray, float]:
+    def _compute_alpha_and_ic(
+        self, expr: str, in_pool: bool = True
+    ) -> Tuple[np.ndarray, np.ndarray, float]:
         """
         统一计算入口：expr -> raw alpha, norm alpha, ic（全程带缓存）
         """
         # 1) raw
-        key_raw = ('raw_alpha', expr)
+        key_raw = ("raw_alpha", expr)
         if key_raw in self._cache:
             raw = self._cache[key_raw]
         else:
             raw = self._compute_alpha_from_expr(expr)
             raw = np.nan_to_num(raw, nan=0.0)
-            self._cache[key_raw] = raw
+            if in_pool:
+                self._cache[key_raw] = raw
 
         # 2) norm
-        key_norm = ('norm_alpha', expr)
+        key_norm = ("norm_alpha", expr)
         if key_norm in self._cache:
             norm = self._cache[key_norm]
         else:
             norm = self._maybe_normalize(raw)
-            self._cache[key_norm] = norm
+            if in_pool:
+                self._cache[key_norm] = norm
 
         # 3) ic
-        key_ic = ('expr_ic', expr)
+        key_ic = ("expr_ic", expr)
         if key_ic in self._cache:
             ic = self._cache[key_ic]
         else:
@@ -131,11 +181,14 @@ class AlphaCombinationModel:
             else:
                 target = self._load_validation_target()
                 ic = information_coefficient(norm, target)
-            self._cache[key_ic] = ic
+            if in_pool:
+                self._cache[key_ic] = ic
 
         return raw, norm, ic
 
-    def _update_pool(self, raw: np.ndarray, norm: np.ndarray, ic: float, expr: str) -> None:
+    def _update_pool(
+        self, raw: np.ndarray, norm: np.ndarray, ic: float, expr: str
+    ) -> None:
         """
         给定已经算好的 raw/norm/ic，把它们塞进因子池并重优化权重。
         """
@@ -145,18 +198,24 @@ class AlphaCombinationModel:
         self.ic_list.append(ic)
         self.expr_list.append(expr)
 
-        # 2. 权重更新
+        # 2. 超出容量时剔除贡献最小的因子
+        if len(self.alphas) > self.max_pool_size:
+            contrib = [abs(w * ic_) for w, ic_ in zip(self.weights, self.ic_list)]
+            idx = int(np.argmin(contrib))
+            for lst in (    
+                self.alphas,
+                self.norm_alphas,
+                self.ic_list,
+                self.weights,
+                self.expr_list,
+            ):
+                lst.pop(idx)
+
+        # 3. 最后才更新权重
         if len(self.norm_alphas) == 1:
             self.weights = [1.0]
         else:
             self._reoptimize_weights()
-
-        # 3. 超出容量时剔除贡献最小的因子
-        if len(self.alphas) > self.max_pool_size:
-            contrib = [abs(w * ic_) for w, ic_ in zip(self.weights, self.ic_list)]
-            idx = int(np.argmin(contrib))
-            for lst in (self.alphas, self.norm_alphas, self.ic_list, self.weights, self.expr_list):
-                lst.pop(idx)
 
     def score(self) -> float:
         """
@@ -221,7 +280,9 @@ class AlphaCombinationModel:
                 fn, arity, _ = func_map[tk]
                 if len(stack) < arity:
                     raise ValueError(f"RPN 表达式参数不足：{tk}")
-                args = [stack.pop() for _ in range(arity)][::-1] # 注意：弹栈顺序需反转以保持原来顺序
+                args = [stack.pop() for _ in range(arity)][
+                    ::-1
+                ]  # 注意：弹栈顺序需反转以保持原来顺序
                 res = fn(*args)
                 stack.append(res)
             else:
@@ -238,7 +299,7 @@ class AlphaCombinationModel:
             series = pd.Series(output, index=self.data.index)
 
         return series.values.astype(np.float64)
-    
+
     def _maybe_normalize(self, alpha: np.ndarray) -> np.ndarray:
         """
         对原始因子序列执行截尾（winsorize）和 Z-score 标准化。
@@ -252,6 +313,7 @@ class AlphaCombinationModel:
         return winsorize(zscore_normalize(alpha))
 
         # === 1. RPN 解析与执行 ====================================================
+
 
 def _is_float(str) -> bool:
     """

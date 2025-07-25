@@ -3,18 +3,37 @@
 data:
   path: "data"                          # 原始行情数据目录
   date_range:
-    - "20250601"
-    - "20250607"
+    - "20250605"
+    - "20250605"
   symbol:
     rb: 10                              # RB 合约手数：10 吨/手
+    sa: 10                              # SA 合约手数：10 吨/手
+    ta: 20                              # TA 合约手数：20 吨/手
   n: 10                                 # 预测 n 秒后收益的窗口大小
   target_col: "target"                  # 目标列名称
+  ticks_per_second: 4                   # 一秒的数据输入
 
 model:
-  max_pool_size: 10                     # 因子池最大容量
+  max_pool_size: 50                     # 因子池最大容量
+  combiner: "lsqp"
+  combiner_kwargs:
+    alpha: 0.3                          # ElasticNet 正则强度
+    l1_ratio: 0.7                       # L1 比例
+    max_iter: 5000                      # 迭代次数
 
 env:
-  max_len: 8                           # 生成序列的最大长度（含 [BOS] 与 [SEP]）
+  max_len: 8                            # 生成序列的最大长度（含 [BOS] 与 [SEP]）
+  base_fields:
+    - mid
+    - bid1
+    - ask1
+    - bidSize1
+    - askSize1
+    - d_vol
+    - d_amt
+    - d_oi
+    - market_hit_bid
+    - market_hit_ask
 
 generator:
   hidden_dim: 128                       # LSTM 隐藏层维度
@@ -26,7 +45,8 @@ generator:
   entropy_coef: 0.01                    # 熵正则系数
   value_coef: 0.5                       # 价值损失系数
   update_epochs: 4                      # 每轮更新的 epoch 数
-  batch_size: 64                       # 采样批量大小
+  rollout_size: 512                     # 一次采样（rollout）总步数
+  mini_batch_size: 128                  # 每次 epoch 内部的 mini-batch 大小
   num_iterations: 300                   # 总训练轮数
 
 random_seed: 42                         # 全局随机种子

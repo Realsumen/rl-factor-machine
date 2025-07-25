@@ -13,9 +13,11 @@ import pandas as pd
 import numpy as np
 from joblib import Parallel, delayed
 
-def load_and_process(file: Path, multiplier: int, n: int) -> pd.DataFrame:
-    df = pd.read_parquet(file)
-    return process_tick_data(df, multiplier=multiplier, n=n)
+def load_and_process(file: Path, multiplier: int, n: int, base_fields: List[str], ticks_per_second: int) -> pd.DataFrame:
+    df = process_tick_data(pd.read_parquet(file), multiplier=multiplier, n=n, ticks_per_second=ticks_per_second)
+    if base_fields is not None:
+        df = df[base_fields + ["target"]]
+    return df 
 
 def load_symbol_dfs(
     directory: str,
@@ -23,7 +25,9 @@ def load_symbol_dfs(
     start_date: str,
     end_date: str,
     n_jobs: int = 4,
-    n: int = 10
+    n: int = 10,
+    base_fields: List[str] = None,
+    ticks_per_second: int = 4
 ) -> Dict[str, List[pd.DataFrame]]:
     dir_path = Path(directory)
     dt_start = datetime.strptime(start_date, "%Y%m%d").date()
@@ -44,14 +48,14 @@ def load_symbol_dfs(
         files = sorted(files)
 
         processed_list = Parallel(n_jobs=n_jobs, backend="loky")(
-            delayed(load_and_process)(file, mul, n)
+            delayed(load_and_process)(file, mul, n, base_fields, ticks_per_second)
             for file in files
         )
         symbol_dfs[sym] = processed_list
 
     return symbol_dfs
 
-def process_tick_data(df: pd.DataFrame, multiplier: int = 10, n: int = 5):
+def process_tick_data(df: pd.DataFrame, multiplier: int = 10, n: int = 5, ticks_per_second: int = 4):
 
     df = df.copy()
     df = df.set_index("timestamp").sort_index()
@@ -59,6 +63,8 @@ def process_tick_data(df: pd.DataFrame, multiplier: int = 10, n: int = 5):
     df["d_vol"] = df["volume"].diff()
     df["d_amt"] = df["amount"].diff()
     df["d_oi"] = df["openInterest"].diff()
+    df["mid"] = (df["ask1"] + df["bid1"]) / 2
+    df["target"] = df["mid"].pct_change(periods=-n*ticks_per_second, fill_method=None)
 
     df.loc[df["d_vol"] <= 0, ["d_vol", "d_amt"]] = np.nan
 
@@ -66,27 +72,6 @@ def process_tick_data(df: pd.DataFrame, multiplier: int = 10, n: int = 5):
 
     df['ts_ceil'] = df.index.to_series().dt.ceil('s')
 
-    group = df.groupby('ts_ceil', sort=True)
-    ohlc = pd.DataFrame({
-        'open':         group['last'].first(),
-        'high':         group['trade_price'].max(),
-        'low':          group['trade_price'].min(),
-        'close':        group['last'].last(),
-        'volume':       group['d_vol'].sum(),
-        'amount':       group['d_amt'].sum(),
-        'openInterest': group['d_oi'].sum(),
-    })
-
-    ohlc.index.name = 'timestamp'
-
-    mask = ohlc['high'].isna()
-    if mask.any():
-        last_max = group['last'].max()
-        last_min = group['last'].min()
-        ohlc.loc[mask, 'high'] = last_max[mask]
-        ohlc.loc[mask, 'low']  = last_min[mask]
-
-    ohlc["target"] = ohlc["close"].pct_change(periods=-n, fill_method=None)
-    return ohlc
+    return df
 
 
